@@ -5,6 +5,7 @@ mod display;
 mod i2c_bus;
 mod power;
 mod setup;
+mod usb_audio;
 mod wifi_config;
 
 use std::{
@@ -19,7 +20,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use embedded_svc::wifi::{AuthMethod, ClientConfiguration, Configuration};
 use esp_idf_hal::{
-    delay::{FreeRtos, TickType},
+    delay::FreeRtos,
     gpio::{Input, PinDriver, Pull},
     i2s::{I2sDriver, I2sRx},
     peripherals::Peripherals,
@@ -37,6 +38,7 @@ use log::{info, warn};
 use m5mic_protocol::{
     AudioFrameHeader, Codec, FLAG_PUSH_TO_TALK, FLAG_STREAM_END, FLAG_STREAM_START, HEADER_LEN,
 };
+use usb_audio::TransportMode;
 
 const SAMPLE_RATE: u32 = 16_000;
 const CHANNELS: u8 = 1;
@@ -56,6 +58,13 @@ const CAPTURE_THREAD_STACK: usize = 6_144;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IdleAction {
     Record(RecordMode),
+    Setup,
+    ToggleTransport,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ButtonBAction {
+    ToggleTransport,
     Setup,
 }
 
@@ -198,15 +207,49 @@ fn main() -> Result<()> {
         .enable_adc()
         .context("enable ES8311 ADC")?;
     info!("ES8311 ADC enabled");
-    drain_i2s(&mut i2s, DRAIN_FRAMES).context("drain startup audio")?;
+    let usb_audio = usb_audio::UsbAudio::new(i2s).context("start USB audio")?;
+    usb_audio.set_transport(TransportMode::Wireless);
+    drain_i2s(&usb_audio, DRAIN_FRAMES).context("drain startup audio")?;
 
     info!("press BtnA to start recording");
     let mut cached_receiver = None;
+    let mut transport = TransportMode::Wireless;
     loop {
+        if transport == TransportMode::Usb {
+            usb_audio.set_transport(TransportMode::Usb);
+            display.show_usb_ready().context("draw USB mic screen")?;
+            match wait_for_usb_action(&button_b, &mut display, &mut pm1_i2c, &usb_audio)
+                .context("wait for USB mode action")?
+            {
+                IdleAction::ToggleTransport => {
+                    transport = TransportMode::Wireless;
+                    usb_audio.set_transport(TransportMode::Wireless);
+                    refresh_battery(&mut pm1_i2c, &mut display).context("draw battery")?;
+                    display.show_ready().context("draw ready screen")?;
+                    info!("transport switched to wireless");
+                    continue;
+                }
+                IdleAction::Setup => {
+                    info!("BtnB held while idle; entering setup portal");
+                    setup::run(&mut wifi, wifi_store.clone(), &mut display, &setup_ssid)?;
+                    return Ok(());
+                }
+                IdleAction::Record(_) => continue,
+            }
+        }
+
         let mode = match wait_for_idle_action(&button_a, &button_b, &mut display, &mut pm1_i2c)
             .context("wait for idle action")?
         {
             IdleAction::Record(mode) => mode,
+            IdleAction::ToggleTransport => {
+                transport = TransportMode::Usb;
+                usb_audio.set_transport(TransportMode::Usb);
+                refresh_battery(&mut pm1_i2c, &mut display).context("draw battery")?;
+                display.show_usb_ready().context("draw USB mic screen")?;
+                info!("transport switched to USB");
+                continue;
+            }
             IdleAction::Setup => {
                 info!("BtnB held while idle; entering setup portal");
                 setup::run(&mut wifi, wifi_store.clone(), &mut display, &setup_ssid)?;
@@ -218,7 +261,7 @@ fn main() -> Result<()> {
         match record_once(
             &mdns,
             &mut cached_receiver,
-            &mut i2s,
+            &usb_audio,
             &button_a,
             &mut display,
             &mut pm1_i2c,
@@ -330,7 +373,7 @@ fn connect_wifi(
 fn record_once(
     mdns: &EspMdns,
     cached_receiver: &mut Option<String>,
-    i2s: &mut I2sDriver<I2sRx>,
+    audio: &usb_audio::UsbAudio,
     button_a: &PinDriver<Input>,
     display: &mut display::StickDisplay<'_>,
     pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
@@ -341,7 +384,8 @@ fn record_once(
         match connect_audio(&server_url) {
             Ok(client) => {
                 info!("recording started; press BtnA to stop");
-                let result = stream_audio_connected(client, i2s, button_a, display, pm1_i2c, mode);
+                let result =
+                    stream_audio_connected(client, audio, button_a, display, pm1_i2c, mode);
                 if result.is_err() {
                     *cached_receiver = None;
                 }
@@ -368,7 +412,7 @@ fn record_once(
     *cached_receiver = Some(server_url);
 
     info!("recording started; press BtnA to stop");
-    let result = stream_audio_connected(client, i2s, button_a, display, pm1_i2c, mode);
+    let result = stream_audio_connected(client, audio, button_a, display, pm1_i2c, mode);
     if result.is_err() {
         *cached_receiver = None;
     }
@@ -418,13 +462,13 @@ fn connect_audio(server_url: &str) -> Result<EspWebSocketClient<'static>> {
 
 fn stream_audio_connected(
     mut client: EspWebSocketClient<'static>,
-    i2s: &mut I2sDriver<I2sRx>,
+    audio: &usb_audio::UsbAudio,
     button_a: &PinDriver<Input>,
     display: &mut display::StickDisplay<'_>,
     pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
     mode: RecordMode,
 ) -> Result<()> {
-    drain_i2s(i2s, DRAIN_FRAMES).context("drain pre-stream audio")?;
+    drain_i2s(audio, DRAIN_FRAMES).context("drain pre-stream audio")?;
     refresh_battery(pm1_i2c, display).context("draw battery")?;
     display
         .show_recording(0, mode.display_mode())
@@ -445,7 +489,7 @@ fn stream_audio_connected(
             .name("m5mic-capture".to_string())
             .stack_size(CAPTURE_THREAD_STACK)
             .spawn_scoped(scope, || {
-                capture_audio_frames(i2s, tx, &stop_capture, &queued_frames, stream_id, mode)
+                capture_audio_frames(audio, tx, &stop_capture, &queued_frames, stream_id, mode)
             })
             .map_err(|err| anyhow!("spawn audio capture thread: {err}"))?;
 
@@ -493,7 +537,7 @@ fn stream_audio_connected(
 }
 
 fn capture_audio_frames(
-    i2s: &mut I2sDriver<I2sRx>,
+    audio: &usb_audio::UsbAudio,
     tx: SyncSender<CapturedFrame>,
     stop_capture: &AtomicBool,
     queued_frames: &AtomicUsize,
@@ -505,7 +549,7 @@ fn capture_audio_frames(
 
     while !stop_capture.load(Ordering::Relaxed) {
         let mut frame = CapturedFrame::new(sequence);
-        read_exact_i2s(i2s, &mut frame.bytes[HEADER_LEN..])?;
+        audio.read_exact(&mut frame.bytes[HEADER_LEN..])?;
         frame.level = pcm_peak_percent(&frame.bytes[HEADER_LEN..]);
 
         let mut flags = mode_flags(mode);
@@ -688,10 +732,10 @@ fn pcm_peak_percent(pcm: &[u8]) -> u8 {
     ((peak * 100) / 32_768).min(100) as u8
 }
 
-fn drain_i2s(i2s: &mut I2sDriver<I2sRx>, frames: usize) -> Result<()> {
+fn drain_i2s(audio: &usb_audio::UsbAudio, frames: usize) -> Result<()> {
     let mut scratch = [0u8; PCM_BYTES];
     for _ in 0..frames {
-        read_exact_i2s(i2s, &mut scratch)?;
+        audio.read_exact(&mut scratch)?;
     }
     Ok(())
 }
@@ -741,15 +785,53 @@ fn wait_for_idle_action(
         if let Some(mode) = consume_record_request(button_a) {
             return Ok(IdleAction::Record(mode));
         }
-        if button_held(button_b, SETUP_IDLE_HOLD_MS) {
-            wait_for_button_release(button_b);
-            return Ok(IdleAction::Setup);
+        if let Some(action) = consume_button_b_action(button_b) {
+            return Ok(match action {
+                ButtonBAction::ToggleTransport => IdleAction::ToggleTransport,
+                ButtonBAction::Setup => IdleAction::Setup,
+            });
         }
 
         let now_us = esp_timer_us();
         if now_us >= next_battery_refresh_us {
             refresh_battery(pm1_i2c, display).context("draw battery")?;
             next_battery_refresh_us = now_us.saturating_add(BATTERY_REFRESH_US);
+        }
+
+        FreeRtos::delay_ms(20);
+    }
+}
+
+fn wait_for_usb_action(
+    button_b: &PinDriver<Input>,
+    display: &mut display::StickDisplay<'_>,
+    pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
+    audio: &usb_audio::UsbAudio,
+) -> Result<IdleAction> {
+    let mut next_battery_refresh_us = esp_timer_us().saturating_add(BATTERY_REFRESH_US);
+    let mut next_level_refresh_us = esp_timer_us().saturating_add(LEVEL_REFRESH_US);
+    let mut last_level = u8::MAX;
+
+    loop {
+        if let Some(action) = consume_button_b_action(button_b) {
+            return Ok(match action {
+                ButtonBAction::ToggleTransport => IdleAction::ToggleTransport,
+                ButtonBAction::Setup => IdleAction::Setup,
+            });
+        }
+
+        let now_us = esp_timer_us();
+        if now_us >= next_battery_refresh_us {
+            refresh_battery(pm1_i2c, display).context("draw battery")?;
+            next_battery_refresh_us = now_us.saturating_add(BATTERY_REFRESH_US);
+        }
+        if now_us >= next_level_refresh_us {
+            let level = audio.level();
+            if level != last_level {
+                display.update_level(level).context("draw USB level")?;
+                last_level = level;
+            }
+            next_level_refresh_us = now_us.saturating_add(LEVEL_REFRESH_US);
         }
 
         FreeRtos::delay_ms(20);
@@ -789,6 +871,30 @@ fn wait_for_setup_hold(button: &PinDriver<Input>) {
     }
 }
 
+fn consume_button_b_action(button: &PinDriver<Input>) -> Option<ButtonBAction> {
+    if !button.is_low() {
+        return None;
+    }
+
+    FreeRtos::delay_ms(30);
+    if !button.is_low() {
+        return None;
+    }
+
+    let started_us = esp_timer_us();
+    let setup_hold_us = SETUP_IDLE_HOLD_MS as u64 * 1_000;
+    while button.is_low() {
+        if esp_timer_us().saturating_sub(started_us) >= setup_hold_us {
+            wait_for_button_release(button);
+            return Some(ButtonBAction::Setup);
+        }
+        FreeRtos::delay_ms(20);
+    }
+
+    FreeRtos::delay_ms(30);
+    Some(ButtonBAction::ToggleTransport)
+}
+
 fn button_held(button: &PinDriver<Input>, hold_ms: u32) -> bool {
     if !button.is_low() {
         return false;
@@ -824,20 +930,6 @@ fn consume_button_press(button: &PinDriver<Input>) -> bool {
 
     wait_for_button_release(button);
     true
-}
-
-fn read_exact_i2s(i2s: &mut I2sDriver<I2sRx>, mut out: &mut [u8]) -> Result<()> {
-    while !out.is_empty() {
-        let read = i2s
-            .read(out, TickType::new_millis(200).ticks())
-            .context("read I2S")?;
-        if read == 0 {
-            return Err(anyhow!("I2S read timeout"));
-        }
-        let (_, rest) = out.split_at_mut(read);
-        out = rest;
-    }
-    Ok(())
 }
 
 fn esp_timer_us() -> u64 {

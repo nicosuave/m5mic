@@ -133,6 +133,14 @@ impl<'d> StickDisplay<'d> {
         self.draw_centered("HOLD A TALK", 219, 1, MUTED)
     }
 
+    pub fn show_usb_ready(&mut self) -> Result<()> {
+        self.base_usb(false)?;
+        self.draw_record_target(false)?;
+        self.draw_centered("USB MIC", 143, 2, TEXT)?;
+        self.draw_level_meter(0)?;
+        self.draw_centered("B WIFI", 223, 1, MUTED)
+    }
+
     pub fn show_finding_receiver(&mut self) -> Result<()> {
         self.show_finding_receiver_phase(0)
     }
@@ -246,6 +254,19 @@ impl<'d> StickDisplay<'d> {
         Ok(())
     }
 
+    fn base_usb(&mut self, recording: bool) -> Result<()> {
+        self.clear(BLACK)?;
+        self.fill_rect(0, 0, WIDTH, HEADER_HEIGHT, PANEL)?;
+        self.fill_rect(0, HEADER_HEIGHT, WIDTH, 1, LINE)?;
+        self.draw_text("USB", 8, 8, 2, TEXT)?;
+        self.draw_usb_mark(56, CYAN)?;
+        self.draw_battery()?;
+        if recording {
+            self.fill_rect(0, HEADER_HEIGHT + 1, WIDTH, 2, RED_DARK)?;
+        }
+        Ok(())
+    }
+
     fn draw_battery(&mut self) -> Result<()> {
         let color = match self.battery.percent {
             Some(percent) if percent <= 15 && !self.battery.external_power => RED,
@@ -290,6 +311,12 @@ impl<'d> StickDisplay<'d> {
         self.fill_rect(x, 18, 3, 4, color)?;
         self.fill_rect(x + 6, 14, 3, 8, color)?;
         self.fill_rect(x + 12, 10, 3, 12, color)
+    }
+
+    fn draw_usb_mark(&mut self, x: i32, color: u16) -> Result<()> {
+        self.fill_rect(x, 18, 18, 3, color)?;
+        self.fill_rect(x + 7, 11, 4, 10, color)?;
+        self.fill_rect(x + 14, 13, 5, 5, color)
     }
 
     fn draw_progress(&mut self, y: i32, color: u16, phase: i32) -> Result<()> {

@@ -1,4 +1,14 @@
 dependencies:
+  espressif/cmake_utilities:
+    component_hash: 05165f30922b422b4b90c08845e6d449329b97370fbd06309803d8cb539d79e3
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.1.1
   espressif/esp_websocket_client:
     component_hash: ac62982fcf9b266409c2299d2b6b1844122105b35163a3b7f8d0adaa9f7eb989
     dependencies:
@@ -19,13 +29,30 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.8.2
+  espressif/tinyusb:
+    component_hash: 7f73a4159dc95325ceaa4ade5e88734c4e1f5124746a3765cf61dc6157d78798
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32s2
+    - esp32s3
+    - esp32p4
+    version: 0.17.0~2
   idf:
     source:
       type: idf
     version: 5.3.2
 direct_dependencies:
+- espressif/cmake_utilities
 - espressif/esp_websocket_client
 - espressif/mdns
-manifest_hash: f3d38fe743c8040c9b5461a4898cf98e454865913a94a60008ba0d3797998d9e
+- espressif/tinyusb
+- idf
+manifest_hash: a8f347a05795c095bfc1925439588d1b80f49a154f8ebdbfa953dd2aa8571658
 target: esp32s3
 version: 2.0.0

@@ -1,8 +1,13 @@
 # m5mic
 
-Rust firmware and a Rust desktop receiver for using an M5StickS3 as a live Wi-Fi microphone.
+Rust firmware and a Rust desktop receiver for using an M5StickS3 as a live microphone.
 
-The first transport is raw `pcm_s16le` over WebSocket. Discovery is handled two ways:
+The firmware has two transports:
+
+1. USB Audio Class microphone. On macOS, it lists as `m5mic` from manufacturer `M5Stack`, 1 channel at 16 kHz.
+2. Raw `pcm_s16le` over WebSocket to the Rust receiver.
+
+Wireless discovery is handled two ways:
 
 1. The receiver advertises `_m5mic._tcp.local` via mDNS.
 2. The firmware falls back to UDP broadcast on port `47777`.
@@ -39,9 +44,11 @@ tmux kill-session -t m5mic-receiver
 lsof -nP -iTCP:47776
 ```
 
-On the StickS3, tap BtnA once to start a locked recording and tap BtnA again to stop. Hold BtnA for push-to-talk; release it to stop. Each start/stop cycle creates a separate WAV file on the receiver.
+In wireless mode, tap BtnA once to start a locked recording and tap BtnA again to stop. Hold BtnA for push-to-talk; release it to stop. Each start/stop cycle creates a separate WAV file on the receiver.
 
-Wi-Fi setup is optional. Hold BtnB during boot, or hold BtnB for about two seconds while idle, to start the captive setup portal. Join the `M5Mic-XXXX` access point and open `http://192.168.71.1` if the captive page does not appear automatically. Saved Wi-Fi credentials are stored in NVS and take priority over the build-time `WIFI_SSID` / `WIFI_PASS` fallback.
+Short-tap BtnB to toggle between wireless mode and USB mic mode. Hold BtnB during boot, or hold BtnB for about two seconds while idle, to start the captive setup portal.
+
+Wi-Fi setup is optional. Join the `M5Mic-XXXX` access point and open `http://192.168.71.1` if the captive page does not appear automatically. Saved Wi-Fi credentials are stored in NVS and take priority over the build-time `WIFI_SSID` / `WIFI_PASS` fallback.
 
 ## UI Preview
 
@@ -84,6 +91,8 @@ Flash the StickS3:
 cd firmware
 espflash flash --port <serial-port> target/xtensa-esp32s3-espidf/release/m5mic-firmware
 ```
+
+After flashing USB Audio firmware, the app owns the native USB device stack while running. If serial monitoring over the same USB cable is unavailable, flash without `--monitor` and use the screen state for basic feedback.
 
 Optional direct receiver override:
 
