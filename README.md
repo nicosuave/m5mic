@@ -175,6 +175,18 @@ espflash flash --port <serial-port> target/xtensa-esp32s3-espidf/release/m5mic-f
 
 After flashing USB Audio firmware, the app owns the native USB device stack while running. If serial monitoring over the same USB cable is unavailable, flash without `--monitor` and use the screen state for basic feedback.
 
+### M5Launcher
+
+For M5Launcher on StickS3, use the exported app binary, not the ELF that `espflash flash` accepts:
+
+```sh
+scripts/export-m5launcher-firmware.sh
+```
+
+The script builds the firmware, writes `target/m5mic-sticks3-m5launcher.bin`, verifies the ESP app-image magic byte, and checks that it fits the StickS3 Launcher app partition. Copy that `.bin` to the Launcher SD card, or upload it through Launcher WebUI, then install it from Launcher.
+
+The Launcher export does not load `.env.local` by default, so local Wi-Fi credentials are not embedded in a shareable `.bin`. For a private build with your local fallback Wi-Fi compiled in, run `M5MIC_INCLUDE_LOCAL_WIFI=1 scripts/export-m5launcher-firmware.sh`.
+
 Optional direct receiver override:
 
 ```sh
