@@ -47,6 +47,7 @@ use m5mic_protocol::{
     FLAG_PUSH_TO_TALK, FLAG_STREAM_END, FLAG_STREAM_START, HEADER_LEN,
 };
 use usb_audio::TransportMode;
+use wifi_config::{AppSettings, BatteryBrightness};
 
 const SAMPLE_RATE: u32 = 16_000;
 const CHANNELS: u8 = 1;
@@ -127,6 +128,7 @@ fn main() -> Result<()> {
     let sys_loop = EspSystemEventLoop::take().context("take system event loop")?;
     let nvs = EspDefaultNvsPartition::take().context("take nvs partition")?;
     let wifi_store = wifi_config::WifiStore::new(nvs.clone());
+    let app_settings = wifi_store.load_settings().context("load app settings")?;
 
     let button_a = PinDriver::input(peripherals.pins.gpio11, Pull::Up).context("create BtnA")?;
     let button_b = PinDriver::input(peripherals.pins.gpio12, Pull::Up).context("create BtnB")?;
@@ -172,6 +174,7 @@ fn main() -> Result<()> {
     )
     .context("create display")?;
     set_battery_from_pm1(&mut pm1_i2c, &mut display);
+    apply_idle_brightness(&mut display, &app_settings).context("set display brightness")?;
     display
         .show_wifi_connecting()
         .context("draw wifi connecting")?;
@@ -189,7 +192,13 @@ fn main() -> Result<()> {
 
     if button_held(&button_b, SETUP_BOOT_HOLD_MS) {
         info!("BtnB held at boot; entering setup portal");
-        setup::run(&mut wifi, wifi_store.clone(), &mut display, &setup_ssid)?;
+        setup::run(
+            &mut wifi,
+            wifi_store.clone(),
+            &mut display,
+            &setup_ssid,
+            &button_b,
+        )?;
         return Ok(());
     }
 
@@ -199,9 +208,16 @@ fn main() -> Result<()> {
             .show_error("WIFI FAIL", "HOLD B SETUP")
             .context("draw wifi setup hint")?;
         wait_for_setup_hold(&button_b);
-        setup::run(&mut wifi, wifi_store.clone(), &mut display, &setup_ssid)?;
+        setup::run(
+            &mut wifi,
+            wifi_store.clone(),
+            &mut display,
+            &setup_ssid,
+            &button_b,
+        )?;
         return Ok(());
     }
+    apply_idle_brightness(&mut display, &app_settings).context("set display brightness")?;
     display.show_ready().context("draw ready screen")?;
 
     let mut mdns = EspMdns::take().context("start mdns")?;
@@ -242,9 +258,7 @@ fn main() -> Result<()> {
     loop {
         if transport == TransportMode::Usb {
             usb_audio.set_transport(TransportMode::Usb);
-            display
-                .set_brightness(display::Brightness::Full)
-                .context("set display brightness")?;
+            apply_idle_brightness(&mut display, &app_settings).context("set display brightness")?;
             display.show_usb_ready().context("draw USB mic screen")?;
             match wait_for_usb_action(
                 &button_b,
@@ -258,17 +272,22 @@ fn main() -> Result<()> {
                 IdleAction::ToggleTransport | IdleAction::SetTransport(TransportMode::Wireless) => {
                     transport = TransportMode::Wireless;
                     usb_audio.set_transport(TransportMode::Wireless);
-                    display
-                        .set_brightness(display::Brightness::Full)
-                        .context("set display brightness")?;
                     refresh_battery(&mut pm1_i2c, &mut display).context("draw battery")?;
+                    apply_idle_brightness(&mut display, &app_settings)
+                        .context("set display brightness")?;
                     display.show_ready().context("draw ready screen")?;
                     info!("transport switched to wireless");
                     continue;
                 }
                 IdleAction::Setup => {
                     info!("BtnB held while idle; entering setup portal");
-                    setup::run(&mut wifi, wifi_store.clone(), &mut display, &setup_ssid)?;
+                    setup::run(
+                        &mut wifi,
+                        wifi_store.clone(),
+                        &mut display,
+                        &setup_ssid,
+                        &button_b,
+                    )?;
                     return Ok(());
                 }
                 IdleAction::SetTransport(TransportMode::Usb) => continue,
@@ -277,9 +296,7 @@ fn main() -> Result<()> {
         }
 
         usb_audio.set_transport(TransportMode::Wireless);
-        display
-            .set_brightness(display::Brightness::Full)
-            .context("set display brightness")?;
+        apply_idle_brightness(&mut display, &app_settings).context("set display brightness")?;
         let mode = match wait_for_idle_action(
             &button_a,
             &button_b,
@@ -293,17 +310,22 @@ fn main() -> Result<()> {
             IdleAction::ToggleTransport | IdleAction::SetTransport(TransportMode::Usb) => {
                 transport = TransportMode::Usb;
                 usb_audio.set_transport(TransportMode::Usb);
-                display
-                    .set_brightness(display::Brightness::Full)
-                    .context("set display brightness")?;
                 refresh_battery(&mut pm1_i2c, &mut display).context("draw battery")?;
+                apply_idle_brightness(&mut display, &app_settings)
+                    .context("set display brightness")?;
                 display.show_usb_ready().context("draw USB mic screen")?;
                 info!("transport switched to USB");
                 continue;
             }
             IdleAction::Setup => {
                 info!("BtnB held while idle; entering setup portal");
-                setup::run(&mut wifi, wifi_store.clone(), &mut display, &setup_ssid)?;
+                setup::run(
+                    &mut wifi,
+                    wifi_store.clone(),
+                    &mut display,
+                    &setup_ssid,
+                    &button_b,
+                )?;
                 return Ok(());
             }
             IdleAction::SetTransport(TransportMode::Wireless) => continue,
@@ -315,8 +337,10 @@ fn main() -> Result<()> {
             &mut cached_receiver,
             &usb_audio,
             &button_a,
+            &button_b,
             &mut display,
             &mut pm1_i2c,
+            &app_settings,
             mode,
         );
         display
@@ -327,10 +351,14 @@ fn main() -> Result<()> {
             Ok(()) => {
                 info!("recording stopped");
                 refresh_battery(&mut pm1_i2c, &mut display).context("draw battery")?;
+                apply_idle_brightness(&mut display, &app_settings)
+                    .context("set display brightness")?;
                 display.show_ready().context("draw ready screen")?;
             }
             Err(err) => {
                 warn!("recording failed: {err:#}");
+                apply_idle_brightness(&mut display, &app_settings)
+                    .context("set display brightness")?;
                 display
                     .show_error("STREAM", "CHECK SERVER")
                     .context("draw stream error")?;
@@ -339,6 +367,7 @@ fn main() -> Result<()> {
 
         FreeRtos::delay_ms(750);
         refresh_battery(&mut pm1_i2c, &mut display).context("draw battery")?;
+        apply_idle_brightness(&mut display, &app_settings).context("set display brightness")?;
         display.show_ready().context("draw ready screen")?;
         info!("press BtnA to start recording");
     }
@@ -466,8 +495,10 @@ fn record_once(
     cached_receiver: &mut Option<String>,
     audio: &usb_audio::UsbAudio,
     button_a: &PinDriver<Input>,
+    button_b: &PinDriver<Input>,
     display: &mut display::StickDisplay<'_>,
     pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
+    settings: &AppSettings,
     mode: RecordMode,
 ) -> Result<()> {
     if let Some(server_url) = cached_receiver.clone() {
@@ -475,8 +506,9 @@ fn record_once(
         match connect_audio(&server_url) {
             Ok(client) => {
                 info!("recording started; press BtnA to stop");
-                let result =
-                    stream_audio_connected(client, audio, button_a, display, pm1_i2c, mode);
+                let result = stream_audio_connected(
+                    client, audio, button_a, button_b, display, pm1_i2c, settings, mode,
+                );
                 if result.is_err() {
                     *cached_receiver = None;
                 }
@@ -503,7 +535,9 @@ fn record_once(
     *cached_receiver = Some(server_url);
 
     info!("recording started; press BtnA to stop");
-    let result = stream_audio_connected(client, audio, button_a, display, pm1_i2c, mode);
+    let result = stream_audio_connected(
+        client, audio, button_a, button_b, display, pm1_i2c, settings, mode,
+    );
     if result.is_err() {
         *cached_receiver = None;
     }
@@ -555,19 +589,18 @@ fn stream_audio_connected(
     mut client: EspWebSocketClient<'static>,
     audio: &usb_audio::UsbAudio,
     button_a: &PinDriver<Input>,
+    button_b: &PinDriver<Input>,
     display: &mut display::StickDisplay<'_>,
     pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
+    settings: &AppSettings,
     mode: RecordMode,
 ) -> Result<()> {
     drain_i2s(audio, DRAIN_FRAMES).context("drain pre-stream audio")?;
     refresh_battery(pm1_i2c, display).context("draw battery")?;
-    let live_meters = display.external_power();
+    let power_save_recording = !display.external_power() && settings.recording_battery_saver;
+    let live_meters = !power_save_recording;
     let track_level = AtomicBool::new(live_meters);
-    let brightness = if live_meters {
-        display::Brightness::Full
-    } else {
-        display::Brightness::Dim
-    };
+    let brightness = display_brightness_for_power(display, settings);
     display
         .set_brightness(brightness)
         .context("set recording brightness")?;
@@ -609,11 +642,14 @@ fn stream_audio_connected(
             rx,
             &queued_frames,
             button_a,
+            button_b,
             display,
             pm1_i2c,
             mode,
             &track_level,
             live_meters,
+            power_save_recording,
+            settings,
             &mut last_sequence,
             &mut have_sent_audio,
         );
@@ -705,11 +741,14 @@ fn send_captured_audio(
     rx: Receiver<CapturedFrame>,
     queued_frames: &AtomicUsize,
     button_a: &PinDriver<Input>,
+    button_b: &PinDriver<Input>,
     display: &mut display::StickDisplay<'_>,
     pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
     mode: RecordMode,
     track_level: &AtomicBool,
     mut live_meters: bool,
+    mut power_save_recording: bool,
+    settings: &AppSettings,
     last_sequence: &mut u32,
     have_sent_audio: &mut bool,
 ) -> Result<StreamStop> {
@@ -719,10 +758,28 @@ fn send_captured_audio(
     let mut next_level_refresh_us = started_us.saturating_add(LEVEL_REFRESH_US);
     let mut meter_level = 0u8;
     let mut last_buffer_frames = usize::MAX;
+    let mut display_off = false;
 
     loop {
         if should_stop_stream(mode, button_a) {
             return Ok(StreamStop::User);
+        }
+        if power_save_recording && consume_button_press(button_b) {
+            display_off = !display_off;
+            if display_off {
+                display
+                    .set_brightness(display::Brightness::Off)
+                    .context("turn recording display off")?;
+            } else {
+                let elapsed_secs = esp_timer_us().saturating_sub(started_us) / 1_000_000;
+                display
+                    .set_brightness(display_brightness_for_power(display, settings))
+                    .context("turn recording display on")?;
+                display
+                    .show_recording(elapsed_secs, mode.display_mode(), false)
+                    .context("redraw recording screen")?;
+                last_elapsed_secs = elapsed_secs;
+            }
         }
 
         match rx.recv_timeout(Duration::from_millis(40)) {
@@ -749,45 +806,59 @@ fn send_captured_audio(
 
         let now_us = esp_timer_us();
         let elapsed_secs = now_us.saturating_sub(started_us) / 1_000_000;
-        if elapsed_secs != last_elapsed_secs {
+        if !display_off && elapsed_secs != last_elapsed_secs {
             display
                 .update_recording_time(elapsed_secs)
                 .context("draw recording time")?;
             last_elapsed_secs = elapsed_secs;
         }
         if now_us >= next_battery_refresh_us {
-            refresh_battery(pm1_i2c, display).context("draw battery")?;
+            if display_off {
+                display.set_battery(read_battery_view(pm1_i2c));
+            } else {
+                refresh_battery(pm1_i2c, display).context("draw battery")?;
+            }
             let external_power = display.external_power();
+            if external_power {
+                display_off = false;
+            }
+            let next_power_save_recording = !external_power && settings.recording_battery_saver;
+            let next_live_meters = !next_power_save_recording;
             display
-                .set_brightness(if external_power {
-                    display::Brightness::Full
+                .set_brightness(if display_off {
+                    display::Brightness::Off
                 } else {
-                    display::Brightness::Dim
+                    display_brightness_for_power(display, settings)
                 })
                 .context("set recording brightness")?;
 
-            if external_power != live_meters {
-                live_meters = external_power;
+            if next_power_save_recording != power_save_recording || next_live_meters != live_meters
+            {
+                power_save_recording = next_power_save_recording;
+                live_meters = next_live_meters;
                 track_level.store(live_meters, Ordering::Relaxed);
                 if !live_meters {
                     meter_level = 0;
                 }
-                display
-                    .show_recording(elapsed_secs, mode.display_mode(), live_meters)
-                    .context("redraw recording screen")?;
+                if !display_off {
+                    display
+                        .show_recording(elapsed_secs, mode.display_mode(), live_meters)
+                        .context("redraw recording screen")?;
+                    last_elapsed_secs = elapsed_secs;
+                }
                 last_buffer_frames = usize::MAX;
             }
 
             next_battery_refresh_us = now_us.saturating_add(RECORDING_POWER_REFRESH_US);
         }
-        if live_meters && now_us >= next_level_refresh_us {
+        if live_meters && !display_off && now_us >= next_level_refresh_us {
             display
                 .update_level(meter_level)
                 .context("draw recording level")?;
             next_level_refresh_us = now_us.saturating_add(LEVEL_REFRESH_US);
         }
 
-        if live_meters {
+        if live_meters && !display_off {
             let buffered = queued_frames
                 .load(Ordering::Relaxed)
                 .min(AUDIO_BUFFER_FRAMES);
@@ -893,6 +964,25 @@ fn refresh_battery(
     display: &mut display::StickDisplay<'_>,
 ) -> Result<()> {
     display.update_battery(read_battery_view(pm1_i2c))
+}
+
+fn apply_idle_brightness(
+    display: &mut display::StickDisplay<'_>,
+    settings: &AppSettings,
+) -> Result<()> {
+    let brightness = display_brightness_for_power(display, settings);
+    display.set_brightness(brightness)
+}
+
+fn display_brightness_for_power(
+    display: &display::StickDisplay<'_>,
+    settings: &AppSettings,
+) -> display::Brightness {
+    if display.external_power() || settings.battery_brightness == BatteryBrightness::Full {
+        display::Brightness::Full
+    } else {
+        display::Brightness::Dim
+    }
 }
 
 fn read_battery_view(pm1_i2c: &mut Option<i2c_bus::I2cDevice>) -> display::BatteryView {

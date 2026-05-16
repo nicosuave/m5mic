@@ -125,11 +125,11 @@ lsof -nP -iTCP:47776
 
 In wireless mode, tap BtnA once to start a latched live stream and tap BtnA again to stop. Hold BtnA for push-to-talk; release it to stop. The menu-bar app uses that audio live only; the standalone receiver CLI creates WAV files only when recordings are enabled.
 
-Short-tap BtnB to toggle between wireless mode and USB mic mode. Hold BtnB during boot, or hold BtnB for about two seconds while idle, to start the captive setup portal.
+Short-tap BtnB to toggle between wireless mode and USB mic mode. Hold BtnB during boot, or hold BtnB for about two seconds while idle, to start the captive setup portal. In setup mode, tap BtnB to reboot back into mic mode.
 
-When recording on battery power, the firmware dims the screen and disables the live level/buffer UI to save power. When external power is connected, it keeps the full recording UI.
+Power settings are configurable from the setup portal. By default, battery mode uses dim screen brightness, and recording on battery pauses the live level/buffer UI to save power. Tap BtnB during battery recording to turn the screen fully off or back on. When external power is connected, it keeps the full recording UI.
 
-Wi-Fi setup is optional. Join the `M5Mic-XXXX` access point and open `http://192.168.71.1` if the captive page does not appear automatically. Saved Wi-Fi credentials are stored in NVS and take priority over the build-time `WIFI_SSID` / `WIFI_PASS` fallback. If Wi-Fi is already saved, the setup page shows the current network and a Reboot to Mic Mode button, so setup mode does not force reconfiguration.
+Wi-Fi setup is optional. Join the `M5Mic-XXXX` access point and open `http://192.168.71.1` if the captive page does not appear automatically. Saved Wi-Fi credentials and power settings are stored in NVS. Saved Wi-Fi takes priority over the build-time `WIFI_SSID` / `WIFI_PASS` fallback. If Wi-Fi is already saved, the setup page shows the current network and a Reboot to Mic Mode button, so setup mode does not force reconfiguration.
 
 ## UI Preview
 

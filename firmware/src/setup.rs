@@ -16,7 +16,10 @@ use embedded_svc::{
     ipv4,
     wifi::{AccessPointConfiguration, AuthMethod, Configuration},
 };
-use esp_idf_hal::delay::FreeRtos;
+use esp_idf_hal::{
+    delay::FreeRtos,
+    gpio::{Input, PinDriver},
+};
 use esp_idf_svc::{
     http::server::{Configuration as HttpServerConfiguration, EspHttpServer},
     netif::{EspNetif, NetifConfiguration, NetifStack},
@@ -26,12 +29,12 @@ use log::{info, warn};
 
 use crate::{
     display::StickDisplay,
-    wifi_config::{WifiCredentials, WifiStore},
+    wifi_config::{AppSettings, BatteryBrightness, WifiCredentials, WifiStore},
 };
 
 const AP_CHANNEL: u8 = 6;
 const AP_IP: [u8; 4] = [192, 168, 71, 1];
-const MAX_FORM_BYTES: usize = 512;
+const MAX_FORM_BYTES: usize = 1024;
 const HTTP_STACK_SIZE: usize = 8192;
 
 const SAVED_HTML: &str = r#"<!doctype html>
@@ -91,6 +94,7 @@ pub fn run(
     store: WifiStore,
     display: &mut StickDisplay<'_>,
     ssid: &str,
+    button_b: &PinDriver<Input>,
 ) -> Result<()> {
     display
         .show_setup_portal(ssid)
@@ -101,9 +105,13 @@ pub fn run(
     let reboot = Arc::new(AtomicBool::new(false));
     let _server = start_http_server(store, saved.clone(), reboot.clone())
         .context("start setup http server")?;
+    wait_for_button_release(button_b);
 
     info!("setup portal listening on http://192.168.71.1 with SSID {ssid}");
     loop {
+        if consume_button_click(button_b) {
+            reboot.store(true, Ordering::SeqCst);
+        }
         if saved.load(Ordering::SeqCst) {
             display
                 .show_setup_saved()
@@ -181,6 +189,7 @@ fn start_http_server(
         })?;
     }
 
+    let wifi_store = store.clone();
     server.fn_handler::<anyhow::Error, _>("/save", Method::Post, move |mut req| {
         let len = req.content_len().unwrap_or(0) as usize;
         if len > MAX_FORM_BYTES {
@@ -194,13 +203,13 @@ fn start_http_server(
         let body = str::from_utf8(&body[..len]).context("decode setup form")?;
         let mut credentials = parse_credentials(body).context("parse setup form")?;
         if credentials.password.is_empty() {
-            if let Some(existing) = store.load().context("load saved wifi config")? {
+            if let Some(existing) = wifi_store.load().context("load saved wifi config")? {
                 if existing.ssid == credentials.ssid {
                     credentials.password = existing.password;
                 }
             }
         }
-        store.save(&credentials).context("save setup wifi")?;
+        wifi_store.save(&credentials).context("save setup wifi")?;
         saved.store(true, Ordering::SeqCst);
 
         let mut resp = req.into_response(
@@ -209,6 +218,34 @@ fn start_http_server(
             &[("Content-Type", "text/html; charset=utf-8")],
         )?;
         resp.write_all(SAVED_HTML.as_bytes())?;
+        Ok(())
+    })?;
+
+    let settings_store = store.clone();
+    let settings_reboot = reboot.clone();
+    server.fn_handler::<anyhow::Error, _>("/settings", Method::Post, move |mut req| {
+        let len = req.content_len().unwrap_or(0) as usize;
+        if len > MAX_FORM_BYTES {
+            req.into_status_response(413)?
+                .write_all(b"Request too large")?;
+            return Ok(());
+        }
+
+        let mut body = [0u8; MAX_FORM_BYTES];
+        req.read_exact(&mut body[..len])?;
+        let body = str::from_utf8(&body[..len]).context("decode settings form")?;
+        let settings = parse_settings(body);
+        settings_store
+            .save_settings(settings)
+            .context("save setup settings")?;
+        settings_reboot.store(true, Ordering::SeqCst);
+
+        let mut resp = req.into_response(
+            200,
+            Some("OK"),
+            &[("Content-Type", "text/html; charset=utf-8")],
+        )?;
+        resp.write_all(REBOOT_HTML.as_bytes())?;
         Ok(())
     })?;
 
@@ -228,18 +265,43 @@ fn start_http_server(
 
 fn settings_html(store: &WifiStore) -> String {
     let saved = store.load().ok().flatten();
+    let settings = store.load_settings().unwrap_or_default();
     let mut html = String::with_capacity(4096);
     let (status, ssid_value, password_hint) = match saved {
         Some(credentials) => (
-            format!("Saved network: {}", escape_html(&credentials.ssid)),
+            format!("Saved: {}", escape_html(&credentials.ssid)),
             escape_html(&credentials.ssid),
             "Leave blank to keep the current password when the Wi-Fi name is unchanged.",
         ),
         None => (
-            "No saved Wi-Fi network.".to_string(),
+            "Not configured".to_string(),
             String::new(),
             "Password is optional for open networks.",
         ),
+    };
+    let dim_checked = if settings.battery_brightness == BatteryBrightness::Dim {
+        " checked"
+    } else {
+        ""
+    };
+    let full_checked = if settings.battery_brightness == BatteryBrightness::Full {
+        " checked"
+    } else {
+        ""
+    };
+    let saver_checked = if settings.recording_battery_saver {
+        " checked"
+    } else {
+        ""
+    };
+    let battery_mode = match settings.battery_brightness {
+        BatteryBrightness::Dim => "dim",
+        BatteryBrightness::Full => "full",
+    };
+    let saver_mode = if settings.recording_battery_saver {
+        "on"
+    } else {
+        "off"
     };
 
     let _ = write!(
@@ -250,39 +312,86 @@ fn settings_html(store: &WifiStore) -> String {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>M5 Mic Settings</title>
 <style>
-html{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#07101d;color:#edf4ff}}
-body{{margin:0;min-height:100vh;display:grid;place-items:center}}
-main{{width:min(420px,calc(100vw - 32px));padding:24px 20px 22px;border:1px solid #263856;background:#0d1728;border-radius:16px}}
-h1{{font-size:28px;margin:0 0 8px}}
-h2{{font-size:15px;margin:22px 0 10px;color:#edf4ff}}
-p{{color:#9fb0c7;margin:0;line-height:1.4}}
-.status{{margin:18px 0 0;padding:13px;border:1px solid #263856;border-radius:12px;background:#07101d;color:#edf4ff}}
-.grid{{display:grid;grid-template-columns:1fr auto;gap:8px 12px;margin-top:10px;color:#9fb0c7;font-size:13px}}
-.value{{color:#edf4ff;text-align:right}}
-label{{display:block;font-size:13px;color:#9fb0c7;margin:14px 0 6px}}
-input{{box-sizing:border-box;width:100%;font:inherit;color:#edf4ff;background:#07101d;border:1px solid #334765;border-radius:10px;padding:13px}}
-button{{width:100%;margin-top:20px;border:0;border-radius:10px;padding:14px;font:700 16px system-ui;background:#ef2e46;color:white}}
-button.secondary{{margin-top:10px;background:#20304a;color:#edf4ff}}
-.hint{{font-size:12px;margin-top:16px}}
+*{{box-sizing:border-box}}
+html{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#070b12;color:#eef4ff;-webkit-font-smoothing:antialiased}}
+body{{margin:0;min-height:100vh;padding:18px;display:flex;justify-content:center;background:#070b12}}
+main{{width:min(440px,100%);align-self:flex-start;padding:22px 20px 24px;border:1px solid #23314b;background:#0d1422;border-radius:18px;box-shadow:0 18px 60px rgba(0,0,0,.38)}}
+button,input{{touch-action:manipulation}}
+.top{{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:18px}}
+.eyebrow{{margin:0 0 4px;color:#7f91ad;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}}
+h1{{font-size:32px;line-height:1;margin:0}}
+h2{{font-size:13px;line-height:1;margin:24px 0 12px;color:#9fb0c7;font-weight:800;letter-spacing:.08em;text-transform:uppercase}}
+p{{color:#9fb0c7;margin:0;line-height:1.45}}
+.pill{{padding:7px 10px;border:1px solid #334765;border-radius:999px;color:#40c4ff;font-size:12px;font-weight:800;background:#0a111d}}
+.status{{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 0;border-top:1px solid #23314b;border-bottom:1px solid #23314b;color:#9fb0c7;font-size:13px}}
+.status strong{{color:#eef4ff;font-size:14px;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.metrics{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}}
+.metric{{padding:13px 12px;border:1px solid #23314b;border-radius:12px;background:#09101b}}
+.metric span{{display:block;color:#7f91ad;font-size:12px;margin-bottom:7px}}
+.metric strong{{display:block;color:#eef4ff;font-size:20px;line-height:1}}
+form{{margin:0;padding:0}}
+.field{{margin-top:14px}}
+label.label{{display:block;font-size:13px;color:#9fb0c7;margin:0 0 7px;font-weight:700}}
+input[type=text],input[type=password]{{width:100%;font:inherit;color:#eef4ff;background:#070b12;border:1px solid #334765;border-radius:12px;padding:14px 13px;outline:none}}
+input[type=text]:focus,input[type=password]:focus{{border-color:#40c4ff;box-shadow:0 0 0 3px rgba(64,196,255,.14)}}
+.seg{{display:grid;grid-template-columns:1fr 1fr;padding:4px;border:1px solid #334765;border-radius:14px;background:#070b12;gap:4px}}
+.seg input{{position:absolute;opacity:0;pointer-events:none}}
+.seg span{{display:block;text-align:center;padding:11px 8px;border-radius:10px;color:#9fb0c7;font-weight:800}}
+.seg input:checked+span{{background:#ef2e46;color:white}}
+.seg input:focus-visible+span{{box-shadow:0 0 0 3px rgba(255,255,255,.22)}}
+.switch{{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:14px;padding:13px 0;border-top:1px solid #23314b;border-bottom:1px solid #23314b;color:#eef4ff;font-weight:700}}
+.switch small{{display:block;margin-top:4px;color:#7f91ad;font-weight:500;line-height:1.35}}
+.switch input{{position:absolute;opacity:0;pointer-events:none}}
+.track{{width:48px;height:28px;border-radius:999px;background:#263856;position:relative;flex:0 0 auto;transition:background-color .15s ease}}
+.track:before{{content:"";position:absolute;width:22px;height:22px;left:3px;top:3px;border-radius:50%;background:#9fb0c7;transition:transform .15s ease,background-color .15s ease}}
+.switch input:checked+.track{{background:#1f9f62}}
+.switch input:checked+.track:before{{transform:translateX(20px);background:white}}
+.switch input:focus-visible+.track{{box-shadow:0 0 0 3px rgba(255,255,255,.22)}}
+button{{width:100%;min-height:46px;margin-top:16px;border:0;border-radius:12px;padding:14px;font:800 15px system-ui;background:#ef2e46;color:white}}
+button:active{{transform:scale(.985)}}
+button.secondary{{margin-top:10px;background:#172338;color:#eef4ff;border:1px solid #334765}}
+.hint{{font-size:12px;margin-top:9px;color:#7f91ad}}
 </style>
 </head>
 <body>
 <main>
-<h1>M5 Mic Settings</h1>
-<p>Use this page to check device settings or update Wi-Fi. Saving Wi-Fi reboots back into mic mode.</p>
-<div class="status">{status}</div>
-<h2>Power profile</h2>
-<div class="grid">
-<span>Recording on battery</span><span class="value">dim screen, meter paused</span>
-<span>Idle Wi-Fi</span><span class="value">power save</span>
-<span>Idle microphone</span><span class="value">codec off</span>
+<div class="top">
+<div>
+<p class="eyebrow">M5StickS3</p>
+<h1>m5mic</h1>
 </div>
+<div class="pill">Setup</div>
+</div>
+<div class="status"><span>Network</span><strong>{status}</strong></div>
+<h2>Power profile</h2>
+<div class="metrics">
+<div class="metric"><span>Battery screen</span><strong>{battery_mode}</strong></div>
+<div class="metric"><span>Recording saver</span><strong>{saver_mode}</strong></div>
+</div>
+<form method="post" action="/settings">
+<div class="field">
+<label class="label">Battery screen brightness</label>
+<div class="seg">
+<label><input type="radio" name="battery_brightness" value="dim"{dim_checked}><span>Dim</span></label>
+<label><input type="radio" name="battery_brightness" value="full"{full_checked}><span>Full</span></label>
+</div>
+</div>
+<label class="switch">
+<span>Recording saver<small>Pause meters on battery. BtnB toggles screen off while recording.</small></span>
+<input type="checkbox" name="recording_battery_saver" value="1"{saver_checked}><span class="track"></span>
+</label>
+<button type="submit">Save Power Settings</button>
+</form>
 <h2>Wi-Fi</h2>
 <form method="post" action="/save">
-<label>Wi-Fi name</label>
-<input name="ssid" maxlength="32" autocomplete="off" autocapitalize="none" value="{ssid_value}" required>
-<label>Password</label>
+<div class="field">
+<label class="label">Wi-Fi name</label>
+<input type="text" name="ssid" maxlength="32" autocomplete="off" autocapitalize="none" spellcheck="false" value="{ssid_value}" required>
+</div>
+<div class="field">
+<label class="label">Password</label>
 <input name="password" maxlength="64" type="password" autocomplete="current-password">
+</div>
 <p class="hint">{password_hint}</p>
 <button type="submit">Save Wi-Fi</button>
 </form>
@@ -319,6 +428,18 @@ fn parse_credentials(body: &str) -> Result<WifiCredentials> {
     Ok(WifiCredentials { ssid, password })
 }
 
+fn parse_settings(body: &str) -> AppSettings {
+    let battery_brightness = match form_value(body, "battery_brightness").as_deref() {
+        Some("full") => BatteryBrightness::Full,
+        _ => BatteryBrightness::Dim,
+    };
+    let recording_battery_saver = form_value(body, "recording_battery_saver").is_some();
+    AppSettings {
+        battery_brightness,
+        recording_battery_saver,
+    }
+}
+
 fn form_value(body: &str, key: &str) -> Option<String> {
     for pair in body.split('&') {
         let (candidate, value) = pair.split_once('=').unwrap_or((pair, ""));
@@ -327,6 +448,27 @@ fn form_value(body: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn wait_for_button_release(button: &PinDriver<Input>) {
+    while button.is_low() {
+        FreeRtos::delay_ms(20);
+    }
+    FreeRtos::delay_ms(30);
+}
+
+fn consume_button_click(button: &PinDriver<Input>) -> bool {
+    if !button.is_low() {
+        return false;
+    }
+
+    FreeRtos::delay_ms(30);
+    if !button.is_low() {
+        return false;
+    }
+
+    wait_for_button_release(button);
+    true
 }
 
 fn url_decode(value: &str) -> String {

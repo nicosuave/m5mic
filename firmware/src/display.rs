@@ -59,6 +59,7 @@ pub enum RecordModeView {
 pub enum Brightness {
     Full,
     Dim,
+    Off,
 }
 
 impl BatteryView {
@@ -132,6 +133,7 @@ impl<'d> StickDisplay<'d> {
         match brightness {
             Brightness::Full => self.set_backlight_percent(BACKLIGHT_FULL_PERCENT),
             Brightness::Dim => self.set_backlight_percent(BACKLIGHT_DIM_PERCENT),
+            Brightness::Off => self.set_backlight_percent(0),
         }
     }
 
@@ -215,9 +217,13 @@ impl<'d> StickDisplay<'d> {
         } else {
             self.fill_rect(9, 161, 117, 56, BLACK)?;
         }
-        match mode {
-            RecordModeView::Latched => self.draw_centered("STOP", 223, 2, MUTED),
-            RecordModeView::PushToTalk => self.draw_centered("RELEASE", 223, 2, MUTED),
+        match (mode, live_meters) {
+            (RecordModeView::Latched, true) => self.draw_centered("STOP", 223, 2, MUTED),
+            (RecordModeView::PushToTalk, true) => self.draw_centered("RELEASE", 223, 2, MUTED),
+            (RecordModeView::Latched, false) => self.draw_centered("A STOP  B OFF", 224, 1, MUTED),
+            (RecordModeView::PushToTalk, false) => {
+                self.draw_centered("RELEASE B OFF", 224, 1, MUTED)
+            }
         }
     }
 
