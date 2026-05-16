@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>AudioServerPlugIn_MachServices</key>
+  <array/>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleExecutable</key>
+  <string>m5mic-coreaudio-driver</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.nicosuave.m5mic.driver</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>m5mic</string>
+  <key>CFBundlePackageType</key>
+  <string>BNDL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleSignature</key>
+  <string>????</string>
+  <key>CFBundleSupportedPlatforms</key>
+  <array>
+    <string>MacOSX</string>
+  </array>
+  <key>CFBundleVersion</key>
+  <string>0.1.0</string>
+  <key>CFPlugInFactories</key>
+  <dict>
+    <key>8B9BA42C-88FA-4E50-94D1-FB3353F5E8B4</key>
+    <string>M5Mic_Create</string>
+  </dict>
+  <key>CFPlugInTypes</key>
+  <dict>
+    <key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+    <array>
+      <string>8B9BA42C-88FA-4E50-94D1-FB3353F5E8B4</string>
+    </array>
+  </dict>
+  <key>NSHumanReadableCopyright</key>
+  <string>MIT</string>
+  <key>NSPrincipalClass</key>
+  <string></string>
+  <key>sandboxSafe</key>
+  <true/>
+</dict>
+</plist>

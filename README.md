@@ -2,10 +2,11 @@
 
 Rust firmware and a Rust desktop receiver for using an M5StickS3 as a live microphone.
 
-The firmware has two transports:
+The firmware has two transports and the Mac side has two receive modes:
 
 1. USB Audio Class microphone. On macOS, it lists as `m5mic` from manufacturer `M5Stack`, 1 channel at 16 kHz.
 2. Raw `pcm_s16le` over WebSocket to the Rust receiver.
+3. Wireless virtual microphone on macOS. The Rust status-bar app hosts the receiver and feeds a Rust CoreAudio driver named `m5mic`.
 
 Wireless discovery is handled two ways:
 
@@ -30,6 +31,12 @@ cargo run -p m5mic-receiver -- --output-dir captures
 
 It listens on `0.0.0.0:47776`, accepts WebSocket connections at `/audio`, and writes each stream to a WAV file.
 
+Virtual mic mode without WAV files:
+
+```sh
+cargo run -p m5mic-receiver -- --virtual-mic --no-recordings
+```
+
 Detached tmux session:
 
 ```sh
@@ -49,6 +56,37 @@ In wireless mode, tap BtnA once to start a locked recording and tap BtnA again t
 Short-tap BtnB to toggle between wireless mode and USB mic mode. Hold BtnB during boot, or hold BtnB for about two seconds while idle, to start the captive setup portal.
 
 Wi-Fi setup is optional. Join the `M5Mic-XXXX` access point and open `http://192.168.71.1` if the captive page does not appear automatically. Saved Wi-Fi credentials are stored in NVS and take priority over the build-time `WIFI_SSID` / `WIFI_PASS` fallback.
+
+## Wireless Virtual Mic
+
+Install the CoreAudio driver. macOS loads HAL plug-ins from the system audio plug-in directory, so this uses `sudo`:
+
+```sh
+scripts/install-coreaudio-driver.sh
+```
+
+Run the status-bar receiver:
+
+```sh
+cargo run -p m5mic-statusbar
+```
+
+Or build a menu-bar `.app` bundle:
+
+```sh
+scripts/build-statusbar-app.sh
+open target/m5mic.app
+```
+
+The status-bar app owns mDNS, UDP discovery, WebSocket receive, and reconnect behavior. It feeds a shared 48 kHz mono float ring buffer. The CoreAudio driver only reads that ring and returns silence when the app is not receiving audio.
+
+After install, macOS apps can select `m5mic` as an input device. Use the status-bar menu to open Sound Settings or quit the receiver.
+
+Uninstall the driver:
+
+```sh
+scripts/uninstall-coreaudio-driver.sh
+```
 
 ## UI Preview
 

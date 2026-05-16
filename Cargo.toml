@@ -1,5 +1,12 @@
 [workspace]
-members = ["protocol", "receiver", "firmware"]
+members = [
+    "protocol",
+    "receiver",
+    "firmware",
+    "virtual-mic",
+    "statusbar",
+    "coreaudio-driver",
+]
 default-members = ["protocol", "receiver"]
 resolver = "2"
 

@@ -1,0 +1,12 @@
+[package]
+name = "m5mic-virtual-mic"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0"
+memmap2 = "0.9.9"
+
+[dev-dependencies]
+tempfile = "3.23.0"
