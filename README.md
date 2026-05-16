@@ -7,6 +7,13 @@ The first transport is raw `pcm_s16le` over WebSocket. Discovery is handled two 
 1. The receiver advertises `_m5mic._tcp.local` via mDNS.
 2. The firmware falls back to UDP broadcast on port `47777`.
 
+## Photos
+
+<p>
+  <img src="docs/images/m5mic-0944.jpg" alt="M5StickS3 ready screen" width="320">
+  <img src="docs/images/m5mic-0945.jpg" alt="M5StickS3 recording screen" width="320">
+</p>
+
 ## Receiver
 
 Foreground development:
