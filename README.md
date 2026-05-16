@@ -125,11 +125,11 @@ lsof -nP -iTCP:47776
 
 In wireless mode, tap BtnA once to start a latched live stream and tap BtnA again to stop. Hold BtnA for push-to-talk; release it to stop. The menu-bar app uses that audio live only; the standalone receiver CLI creates WAV files only when recordings are enabled.
 
-Short-tap BtnB to toggle between wireless mode and USB mic mode. Hold BtnB during boot, or hold BtnB for about two seconds while idle, to start the captive setup portal. In setup mode, tap BtnB to reboot back into mic mode.
+Short-tap BtnB to cycle the active mode: Wi-Fi, Bluetooth, USB, then back to Wi-Fi. The menu-bar app exposes separate mode items for Wi-Fi, Bluetooth, and USB. Hold BtnB during boot, or hold BtnB for about two seconds while idle, to start the captive setup portal. In setup mode, tap BtnB to reboot back into mic mode.
 
-Power settings are configurable from the setup portal. By default, battery mode uses dim screen brightness, and recording on battery pauses the live level/buffer UI to save power. Tap BtnB during battery recording to turn the screen fully off or back on. When external power is connected, it keeps the full recording UI.
+Wireless and power settings are configurable from the setup portal. Wi-Fi and Bluetooth are separate runtime modes, not firmware variants. The Wi-Fi audio codec defaults to `pcm_s16le`; `ima_adpcm4` can be selected there to reduce Wi-Fi audio payload size while the receiver/menu-bar app decodes it back to PCM for the virtual microphone. Bluetooth uses the custom m5mic BLE GATT service and sends `ima_adpcm4` audio fragments. By default, battery mode uses dim screen brightness, and recording on battery pauses the live level/buffer UI to save power. Tap BtnB during battery recording to turn the screen fully off or back on. When external power is connected, it keeps the full recording UI.
 
-Wi-Fi setup is optional. Join the `M5Mic-XXXX` access point and open `http://192.168.71.1` if the captive page does not appear automatically. Saved Wi-Fi credentials and power settings are stored in NVS. Saved Wi-Fi takes priority over the build-time `WIFI_SSID` / `WIFI_PASS` fallback. If Wi-Fi is already saved, the setup page shows the current network and a Reboot to Mic Mode button, so setup mode does not force reconfiguration.
+Wi-Fi setup is optional. Join the `M5Mic-XXXX` access point and open `http://192.168.71.1` if the captive page does not appear automatically. The setup page has one save action for Wi-Fi credentials, Wi-Fi codec, and power settings. Bluetooth does not need credentials or pairing; switch to it with BtnB or the menu-bar app. Saved Wi-Fi takes priority over the build-time `WIFI_SSID` / `WIFI_PASS` fallback.
 
 ## UI Preview
 
@@ -165,6 +165,8 @@ set -a
 set +a
 cargo +esp build --release
 ```
+
+The firmware is not split into codec variants or transport variants. Use BtnB or the menu-bar app to switch between Wi-Fi, Bluetooth, and USB. Use the setup portal only for Wi-Fi credentials, Wi-Fi codec, and power settings; saved settings apply at stream start.
 
 Flash the StickS3:
 

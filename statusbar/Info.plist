@@ -28,5 +28,7 @@
   <true/>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>m5mic uses Bluetooth to receive live microphone audio from the M5StickS3.</string>
 </dict>
 </plist>

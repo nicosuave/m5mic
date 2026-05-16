@@ -10,6 +10,7 @@ embedded-svc = "0.29.0"
 esp-idf-hal = "0.46.2"
 esp-idf-svc = "0.52.1"
 esp-idf-sys = "0.37.2"
+esp32-nimble = "0.12.0"
 log = "0.4"
 m5mic-protocol = { path = "../protocol", default-features = false }
 

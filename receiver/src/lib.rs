@@ -30,6 +30,8 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
+use m5mic_protocol::{ima_adpcm4_decode, ImaAdpcmState};
+
 #[derive(Clone, Debug)]
 pub struct ReceiverConfig {
     pub listen: String,
@@ -68,6 +70,82 @@ struct AppState {
     output_dir: Option<PathBuf>,
     virtual_mic: Option<Arc<Mutex<VirtualMicWriter>>>,
     status_tx: Option<watch::Sender<ReceiverStatus>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveAudioStatus {
+    Started { stream_id: u32 },
+    Audio { stream_id: u32 },
+    Ended { stream_id: u32 },
+}
+
+pub struct LiveAudioOutput {
+    virtual_mic: VirtualMicWriter,
+    virtual_buffer: Vec<f32>,
+    decoded_pcm: Vec<u8>,
+    adpcm_state: ImaAdpcmState,
+    active_stream_id: Option<u32>,
+}
+
+impl LiveAudioOutput {
+    pub fn open_default() -> Result<Self> {
+        let mut virtual_mic = VirtualMicWriter::open_default().context("open virtual mic ring")?;
+        virtual_mic.set_idle();
+        Ok(Self {
+            virtual_mic,
+            virtual_buffer: Vec::with_capacity(1_920),
+            decoded_pcm: Vec::with_capacity(1_280),
+            adpcm_state: ImaAdpcmState::new(),
+            active_stream_id: None,
+        })
+    }
+
+    pub fn handle_frame(&mut self, frame: &[u8]) -> Result<LiveAudioStatus> {
+        let header = AudioFrameHeader::decode(frame)
+            .map_err(|err| anyhow::anyhow!("decode audio header: {err:?}"))?;
+        let stream_started =
+            header.is_stream_start() || self.active_stream_id != Some(header.stream_id);
+        if stream_started {
+            self.active_stream_id = Some(header.stream_id);
+            self.adpcm_state.reset();
+        }
+
+        if header.is_stream_end() {
+            self.set_idle();
+            return Ok(LiveAudioStatus::Ended {
+                stream_id: header.stream_id,
+            });
+        }
+
+        let payload = header
+            .payload(frame)
+            .map_err(|err| anyhow::anyhow!("read audio payload: {err:?}"))?;
+        if !payload.is_empty() {
+            let pcm_payload = decode_audio_payload(
+                &header,
+                payload,
+                &mut self.decoded_pcm,
+                &mut self.adpcm_state,
+            )?;
+            write_virtual_mic_writer(&mut self.virtual_mic, pcm_payload, &mut self.virtual_buffer);
+        }
+
+        if stream_started {
+            Ok(LiveAudioStatus::Started {
+                stream_id: header.stream_id,
+            })
+        } else {
+            Ok(LiveAudioStatus::Audio {
+                stream_id: header.stream_id,
+            })
+        }
+    }
+
+    pub fn set_idle(&mut self) {
+        self.virtual_mic.set_idle();
+        self.active_stream_id = None;
+        self.adpcm_state.reset();
+    }
 }
 
 pub async fn run(
@@ -131,6 +209,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut active_stream_id: Option<u32> = None;
     let mut expected_sequence: Option<u32> = None;
     let mut virtual_buffer = Vec::with_capacity(1_920);
+    let mut adpcm_state = ImaAdpcmState::new();
+    let mut decoded_pcm = Vec::with_capacity(1_280);
 
     while let Some(message) = socket.next().await {
         let message = match message {
@@ -151,11 +231,6 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     }
                 };
 
-                if header.codec != Codec::PcmS16Le {
-                    warn!(?header.codec, "unsupported codec");
-                    continue;
-                }
-
                 if header.is_stream_start() || active_stream_id != Some(header.stream_id) {
                     if let Some(previous) = active_stream_id {
                         if previous != header.stream_id {
@@ -168,6 +243,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     }
                     active_stream_id = Some(header.stream_id);
                     expected_sequence = None;
+                    adpcm_state.reset();
                     publish_status(
                         &state,
                         ReceiverStatus::Receiving {
@@ -222,7 +298,20 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     continue;
                 }
 
-                write_virtual_mic(&state, payload, &mut virtual_buffer);
+                let pcm_payload = match decode_audio_payload(
+                    &header,
+                    payload,
+                    &mut decoded_pcm,
+                    &mut adpcm_state,
+                ) {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        warn!(%err, "dropping bad audio frame");
+                        continue;
+                    }
+                };
+
+                write_virtual_mic(&state, pcm_payload, &mut virtual_buffer);
 
                 if state.output_dir.is_some() && writer.is_none() {
                     let output_dir = state.output_dir.as_ref().expect("checked output dir");
@@ -254,7 +343,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 }
 
                 if let Some(writer) = writer.as_mut() {
-                    match write_pcm_payload(writer, payload) {
+                    match write_pcm_payload(writer, pcm_payload) {
                         Ok(written) => {
                             frames += 1;
                             samples += written;
@@ -272,7 +361,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     }
                 } else {
                     frames += 1;
-                    samples += (payload.len() / 2) as u64;
+                    samples += (pcm_payload.len() / 2) as u64;
                 }
             }
             Message::Close(reason) => {
@@ -343,15 +432,41 @@ fn write_pcm_payload(
     Ok(written)
 }
 
+fn decode_audio_payload<'a>(
+    header: &AudioFrameHeader,
+    payload: &'a [u8],
+    decoded_pcm: &'a mut Vec<u8>,
+    adpcm_state: &mut ImaAdpcmState,
+) -> Result<&'a [u8]> {
+    match header.codec {
+        Codec::PcmS16Le => Ok(payload),
+        Codec::ImaAdpcm4 => {
+            let sample_count = payload.len() * 2;
+            decoded_pcm.resize(sample_count * 2, 0);
+            let decoded_len = ima_adpcm4_decode(payload, sample_count, decoded_pcm, adpcm_state)
+                .map_err(|err| anyhow::anyhow!("decode adpcm frame: {err:?}"))?;
+            Ok(&decoded_pcm[..decoded_len])
+        }
+    }
+}
+
 fn write_virtual_mic(state: &AppState, payload: &[u8], buffer: &mut Vec<f32>) {
     let Some(virtual_mic) = &state.virtual_mic else {
         return;
     };
 
-    pcm_s16le_16k_mono_to_f32_48k(payload, buffer);
     if let Ok(mut writer) = virtual_mic.lock() {
-        writer.write_f32(buffer);
+        write_virtual_mic_writer(&mut writer, payload, buffer);
     }
+}
+
+fn write_virtual_mic_writer(
+    virtual_mic: &mut VirtualMicWriter,
+    payload: &[u8],
+    buffer: &mut Vec<f32>,
+) {
+    pcm_s16le_16k_mono_to_f32_48k(payload, buffer);
+    virtual_mic.write_f32(buffer);
 }
 
 fn set_virtual_mic_idle(state: &AppState) {
@@ -399,6 +514,7 @@ fn advertise_mdns(config: &ReceiverConfig) -> Result<ServiceDaemon> {
     let props = [
         ("path", WS_PATH),
         ("codec", "pcm_s16le"),
+        ("codecs", "pcm_s16le,ima_adpcm4"),
         ("sample_rate", "16000"),
         ("channels", "1"),
         ("udp_discovery_port", "47777"),
@@ -498,6 +614,7 @@ fn now_unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use m5mic_protocol::{ima_adpcm4_encode, FLAG_STREAM_START};
 
     #[test]
     fn resamples_16k_s16_mono_to_48k_f32() {
@@ -511,5 +628,41 @@ mod tests {
         assert!(out[1] > 0.16 && out[1] < 0.17);
         assert!(out[2] > 0.33 && out[2] < 0.34);
         assert_eq!(out[3], 0.5);
+    }
+
+    #[test]
+    fn decodes_adpcm_payload_to_pcm_for_audio_pipeline() {
+        let mut pcm = [0u8; 1_280];
+        for (index, sample) in pcm.chunks_exact_mut(2).enumerate() {
+            let value = (((index as i32 % 96) - 48) * 300) as i16;
+            sample.copy_from_slice(&value.to_le_bytes());
+        }
+
+        let mut adpcm = [0u8; 320];
+        let mut encode_state = ImaAdpcmState::new();
+        let adpcm_len = ima_adpcm4_encode(&pcm, &mut adpcm, &mut encode_state).unwrap();
+        let header = AudioFrameHeader::new(
+            Codec::ImaAdpcm4,
+            1,
+            16_000,
+            0,
+            0,
+            adpcm_len as u16,
+            1,
+            FLAG_STREAM_START,
+        );
+
+        let mut decoded = Vec::new();
+        let mut decode_state = ImaAdpcmState::new();
+        let payload = decode_audio_payload(
+            &header,
+            &adpcm[..adpcm_len],
+            &mut decoded,
+            &mut decode_state,
+        )
+        .unwrap();
+
+        assert_eq!(payload.len(), pcm.len());
+        assert!(payload.chunks_exact(2).any(|sample| sample != [0, 0]));
     }
 }

@@ -35,7 +35,7 @@ Copy `target/m5mic-sticks3-m5launcher.bin` to the Launcher SD card or upload it 
 
 The Launcher export does not load `.env.local` by default, so local Wi-Fi credentials are not embedded in a shareable `.bin`. For a private build with your local fallback Wi-Fi compiled in, run `M5MIC_INCLUDE_LOCAL_WIFI=1 scripts/export-m5launcher-firmware.sh` from the repo root.
 
-Short-tap BtnB to toggle between wireless mode and USB Audio Class mic mode. The status-bar app can also switch modes by sending a UDP command on port `47779`. In USB mode, no receiver is required. On macOS, it lists as `m5mic` from manufacturer `M5Stack`, 1 channel at 16 kHz.
+Short-tap BtnB to cycle Wi-Fi, Bluetooth, USB, then back to Wi-Fi. The status-bar app has separate Wi-Fi, Bluetooth, and USB mode items and sends UDP mode commands on port `47779`. In USB mode, no receiver is required. On macOS, it lists as `m5mic` from manufacturer `M5Stack`, 1 channel at 16 kHz.
 
 In wireless mode, the firmware discovers the receiver in this order:
 
@@ -43,7 +43,7 @@ In wireless mode, the firmware discovers the receiver in this order:
 2. mDNS query for `_m5mic._tcp.local`.
 3. UDP broadcast on `255.255.255.255:47777`.
 
-Wireless audio format is `pcm_s16le`, mono, 16 kHz, sent as 40 ms binary WebSocket frames.
+Wireless audio is mono, 16 kHz. Wi-Fi sends 40 ms binary WebSocket frames, with the setup portal controlling `pcm_s16le` by default or `ima_adpcm4` for smaller payloads. Bluetooth uses the custom m5mic BLE GATT service and sends fragmented `ima_adpcm4` frames by notification. Bluetooth needs no captive-portal setup, Wi-Fi password, or pairing; switch to it with BtnB or the menu-bar app. The menu-bar app can send mode commands over BLE control writes when Wi-Fi UDP is unavailable. The receiver/menu-bar app decodes ADPCM back to PCM before feeding the virtual microphone.
 
 In wireless mode, press BtnA to start recording. Press BtnA again to stop and close the current WAV on the receiver.
 

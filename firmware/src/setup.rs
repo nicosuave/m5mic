@@ -29,12 +29,12 @@ use log::{info, warn};
 
 use crate::{
     display::StickDisplay,
-    wifi_config::{AppSettings, BatteryBrightness, WifiCredentials, WifiStore},
+    wifi_config::{AppSettings, BatteryBrightness, WifiCredentials, WifiStore, WirelessCodec},
 };
 
 const AP_CHANNEL: u8 = 6;
 const AP_IP: [u8; 4] = [192, 168, 71, 1];
-const MAX_FORM_BYTES: usize = 1024;
+const MAX_FORM_BYTES: usize = 2048;
 const HTTP_STACK_SIZE: usize = 8192;
 
 const SAVED_HTML: &str = r#"<!doctype html>
@@ -201,15 +201,22 @@ fn start_http_server(
         let mut body = [0u8; MAX_FORM_BYTES];
         req.read_exact(&mut body[..len])?;
         let body = str::from_utf8(&body[..len]).context("decode setup form")?;
-        let mut credentials = parse_credentials(body).context("parse setup form")?;
-        if credentials.password.is_empty() {
-            if let Some(existing) = wifi_store.load().context("load saved wifi config")? {
-                if existing.ssid == credentials.ssid {
-                    credentials.password = existing.password;
+        let settings = parse_settings(body);
+        wifi_store
+            .save_settings(settings)
+            .context("save setup settings")?;
+
+        let mut credentials = parse_credentials(body);
+        if !credentials.ssid.is_empty() {
+            if credentials.password.is_empty() {
+                if let Some(existing) = wifi_store.load().context("load saved wifi config")? {
+                    if existing.ssid == credentials.ssid {
+                        credentials.password = existing.password;
+                    }
                 }
             }
+            wifi_store.save(&credentials).context("save setup wifi")?;
         }
-        wifi_store.save(&credentials).context("save setup wifi")?;
         saved.store(true, Ordering::SeqCst);
 
         let mut resp = req.into_response(
@@ -294,6 +301,16 @@ fn settings_html(store: &WifiStore) -> String {
     } else {
         ""
     };
+    let pcm_checked = if settings.wireless_codec == WirelessCodec::PcmS16Le {
+        " checked"
+    } else {
+        ""
+    };
+    let adpcm_checked = if settings.wireless_codec == WirelessCodec::ImaAdpcm4 {
+        " checked"
+    } else {
+        ""
+    };
     let battery_mode = match settings.battery_brightness {
         BatteryBrightness::Dim => "dim",
         BatteryBrightness::Full => "full",
@@ -303,6 +320,8 @@ fn settings_html(store: &WifiStore) -> String {
     } else {
         "off"
     };
+    let codec_mode = settings.wireless_codec.label();
+    let modes = "Wi-Fi BT USB";
 
     let _ = write!(
         html,
@@ -363,12 +382,21 @@ button.secondary{{margin-top:10px;background:#172338;color:#eef4ff;border:1px so
 <div class="pill">Setup</div>
 </div>
 <div class="status"><span>Network</span><strong>{status}</strong></div>
-<h2>Power profile</h2>
+<h2>Modes</h2>
 <div class="metrics">
+<div class="metric"><span>BtnB cycle</span><strong>{modes}</strong></div>
+<div class="metric"><span>Wi-Fi codec</span><strong>{codec_mode}</strong></div>
 <div class="metric"><span>Battery screen</span><strong>{battery_mode}</strong></div>
-<div class="metric"><span>Recording saver</span><strong>{saver_mode}</strong></div>
+<div class="metric"><span>Rec saver</span><strong>{saver_mode}</strong></div>
 </div>
-<form method="post" action="/settings">
+<form method="post" action="/save">
+<div class="field">
+<label class="label">Wi-Fi audio codec</label>
+<div class="seg">
+<label><input type="radio" name="wireless_codec" value="pcm_s16le"{pcm_checked}><span>PCM</span></label>
+<label><input type="radio" name="wireless_codec" value="ima_adpcm4"{adpcm_checked}><span>ADPCM</span></label>
+</div>
+</div>
 <div class="field">
 <label class="label">Battery screen brightness</label>
 <div class="seg">
@@ -380,20 +408,17 @@ button.secondary{{margin-top:10px;background:#172338;color:#eef4ff;border:1px so
 <span>Recording saver<small>Pause meters on battery. BtnB toggles screen off while recording.</small></span>
 <input type="checkbox" name="recording_battery_saver" value="1"{saver_checked}><span class="track"></span>
 </label>
-<button type="submit">Save Power Settings</button>
-</form>
 <h2>Wi-Fi</h2>
-<form method="post" action="/save">
 <div class="field">
 <label class="label">Wi-Fi name</label>
-<input type="text" name="ssid" maxlength="32" autocomplete="off" autocapitalize="none" spellcheck="false" value="{ssid_value}" required>
+<input type="text" name="ssid" maxlength="32" autocomplete="off" autocapitalize="none" spellcheck="false" value="{ssid_value}">
 </div>
 <div class="field">
 <label class="label">Password</label>
 <input name="password" maxlength="64" type="password" autocomplete="current-password">
 </div>
 <p class="hint">{password_hint}</p>
-<button type="submit">Save Wi-Fi</button>
+<button type="submit">Save and Reboot</button>
 </form>
 <form method="post" action="/reboot">
 <button class="secondary" type="submit">Reboot to Mic Mode</button>
@@ -422,10 +447,13 @@ fn escape_html(input: &str) -> String {
     escaped
 }
 
-fn parse_credentials(body: &str) -> Result<WifiCredentials> {
-    let ssid = form_value(body, "ssid").ok_or_else(|| anyhow!("ssid missing"))?;
+fn parse_credentials(body: &str) -> WifiCredentials {
+    let ssid = form_value(body, "ssid")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     let password = form_value(body, "password").unwrap_or_default();
-    Ok(WifiCredentials { ssid, password })
+    WifiCredentials { ssid, password }
 }
 
 fn parse_settings(body: &str) -> AppSettings {
@@ -434,9 +462,14 @@ fn parse_settings(body: &str) -> AppSettings {
         _ => BatteryBrightness::Dim,
     };
     let recording_battery_saver = form_value(body, "recording_battery_saver").is_some();
+    let wireless_codec = match form_value(body, "wireless_codec").as_deref() {
+        Some("ima_adpcm4") => WirelessCodec::ImaAdpcm4,
+        _ => WirelessCodec::PcmS16Le,
+    };
     AppSettings {
         battery_brightness,
         recording_battery_saver,
+        wireless_codec,
     }
 }
 

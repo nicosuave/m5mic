@@ -6,8 +6,10 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1.0"
+btleplug = "0.12.0"
 clap = { version = "4.6.1", features = ["derive"] }
 coreaudio-sys = { version = "0.2.17", default-features = false, features = ["core_audio"] }
+futures-util = "0.3"
 if-addrs = "0.13"
 m5mic-protocol = { path = "../protocol" }
 m5mic-receiver = { path = "../receiver" }
@@ -15,4 +17,5 @@ tokio = { version = "1.48.0", features = ["rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tray-icon = { version = "0.24.0", default-features = false }
+uuid = "1.18.1"
 winit = "0.30.12"

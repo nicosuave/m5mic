@@ -1,4 +1,5 @@
 mod audio;
+mod ble;
 mod codec;
 mod discovery;
 mod display;
@@ -43,7 +44,8 @@ use esp_idf_svc::{
 };
 use log::{info, warn};
 use m5mic_protocol::{
-    AudioFrameHeader, Codec, CONTROL_MODE_USB, CONTROL_MODE_WIRELESS, CONTROL_PORT,
+    ima_adpcm4_encode, ima_adpcm4_encoded_len, AudioFrameHeader, Codec, ImaAdpcmState,
+    CONTROL_MODE_BLE, CONTROL_MODE_USB, CONTROL_MODE_WIFI, CONTROL_MODE_WIRELESS, CONTROL_PORT,
     FLAG_PUSH_TO_TALK, FLAG_STREAM_END, FLAG_STREAM_START, HEADER_LEN,
 };
 use usb_audio::TransportMode;
@@ -54,6 +56,7 @@ const CHANNELS: u8 = 1;
 const FRAME_MS: usize = 40;
 const FRAME_SAMPLES: usize = SAMPLE_RATE as usize * FRAME_MS / 1_000;
 const PCM_BYTES: usize = FRAME_SAMPLES * 2;
+const ADPCM_BYTES: usize = ima_adpcm4_encoded_len(PCM_BYTES);
 const FRAME_BYTES: usize = HEADER_LEN + PCM_BYTES;
 const AUDIO_BUFFER_FRAMES: usize = 8;
 const DRAIN_FRAMES: usize = 8;
@@ -69,13 +72,13 @@ const CAPTURE_THREAD_STACK: usize = 12_288;
 enum IdleAction {
     Record(RecordMode),
     Setup,
-    ToggleTransport,
-    SetTransport(TransportMode),
+    CycleMode,
+    SetMode(ActiveMode),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ButtonBAction {
-    ToggleTransport,
+    CycleMode,
     Setup,
 }
 
@@ -83,6 +86,36 @@ enum ButtonBAction {
 enum RecordMode {
     Latched,
     PushToTalk,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModeCommand {
+    SetMode(ActiveMode),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActiveMode {
+    Wifi,
+    Bluetooth,
+    Usb,
+}
+
+impl ActiveMode {
+    const fn next(self) -> Self {
+        match self {
+            Self::Wifi => Self::Bluetooth,
+            Self::Bluetooth => Self::Usb,
+            Self::Usb => Self::Wifi,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Wifi => "Wi-Fi",
+            Self::Bluetooth => "Bluetooth",
+            Self::Usb => "USB",
+        }
+    }
 }
 
 impl RecordMode {
@@ -100,6 +133,7 @@ impl RecordMode {
 
 struct CapturedFrame {
     bytes: [u8; FRAME_BYTES],
+    len: usize,
     level: u8,
     sequence: u32,
 }
@@ -108,6 +142,7 @@ impl CapturedFrame {
     fn new(sequence: u32) -> Self {
         Self {
             bytes: [0; FRAME_BYTES],
+            len: HEADER_LEN,
             level: 0,
             sequence,
         }
@@ -175,9 +210,6 @@ fn main() -> Result<()> {
     .context("create display")?;
     set_battery_from_pm1(&mut pm1_i2c, &mut display);
     apply_idle_brightness(&mut display, &app_settings).context("set display brightness")?;
-    display
-        .show_wifi_connecting()
-        .context("draw wifi connecting")?;
 
     let wifi_driver =
         WifiDriver::new(peripherals.modem, sys_loop.clone(), Some(nvs)).context("create wifi")?;
@@ -201,30 +233,6 @@ fn main() -> Result<()> {
         )?;
         return Ok(());
     }
-
-    if let Err(err) = connect_wifi(&mut wifi, &wifi_store) {
-        warn!("wifi connection failed: {err:#}");
-        display
-            .show_error("WIFI FAIL", "HOLD B SETUP")
-            .context("draw wifi setup hint")?;
-        wait_for_setup_hold(&button_b);
-        setup::run(
-            &mut wifi,
-            wifi_store.clone(),
-            &mut display,
-            &setup_ssid,
-            &button_b,
-        )?;
-        return Ok(());
-    }
-    apply_idle_brightness(&mut display, &app_settings).context("set display brightness")?;
-    display.show_ready().context("draw ready screen")?;
-
-    let mut mdns = EspMdns::take().context("start mdns")?;
-    mdns.set_hostname("m5sticks3-mic")
-        .context("set mdns hostname")?;
-    mdns.set_instance_name("M5StickS3 Mic")
-        .context("set mdns instance")?;
 
     let i2s_config = audio::mic_i2s_config(SAMPLE_RATE);
     let mut i2s = I2sDriver::<I2sRx>::new_std_rx(
@@ -253,68 +261,76 @@ fn main() -> Result<()> {
     let control_socket = create_control_socket().context("start mode control socket")?;
 
     info!("press BtnA to start recording");
+    let mut mdns = None;
+    let mut ble_audio = None;
     let mut cached_receiver = None;
-    let mut transport = TransportMode::Wireless;
+    let mut active_mode = ActiveMode::Wifi;
+    activate_mode(
+        active_mode,
+        &mut wifi,
+        &wifi_store,
+        &mut mdns,
+        &mut ble_audio,
+        &mut display,
+        &mut pm1_i2c,
+        &usb_audio,
+        &app_settings,
+    )?;
+
     loop {
-        if transport == TransportMode::Usb {
-            usb_audio.set_transport(TransportMode::Usb);
-            apply_idle_brightness(&mut display, &app_settings).context("set display brightness")?;
-            display.show_usb_ready().context("draw USB mic screen")?;
-            match wait_for_usb_action(
+        let action = match active_mode {
+            ActiveMode::Usb => wait_for_usb_action(
                 &button_b,
                 &mut display,
                 &mut pm1_i2c,
                 &usb_audio,
                 &control_socket,
+                ble_audio.as_ref(),
             )
-            .context("wait for USB mode action")?
-            {
-                IdleAction::ToggleTransport | IdleAction::SetTransport(TransportMode::Wireless) => {
-                    transport = TransportMode::Wireless;
-                    usb_audio.set_transport(TransportMode::Wireless);
-                    refresh_battery(&mut pm1_i2c, &mut display).context("draw battery")?;
-                    apply_idle_brightness(&mut display, &app_settings)
-                        .context("set display brightness")?;
-                    display.show_ready().context("draw ready screen")?;
-                    info!("transport switched to wireless");
-                    continue;
-                }
-                IdleAction::Setup => {
-                    info!("BtnB held while idle; entering setup portal");
-                    setup::run(
-                        &mut wifi,
-                        wifi_store.clone(),
-                        &mut display,
-                        &setup_ssid,
-                        &button_b,
-                    )?;
-                    return Ok(());
-                }
-                IdleAction::SetTransport(TransportMode::Usb) => continue,
-                IdleAction::Record(_) => continue,
-            }
-        }
+            .context("wait for USB mode action")?,
+            ActiveMode::Wifi | ActiveMode::Bluetooth => wait_for_idle_action(
+                &button_a,
+                &button_b,
+                &mut display,
+                &mut pm1_i2c,
+                &control_socket,
+                ble_audio.as_ref(),
+            )
+            .context("wait for idle action")?,
+        };
 
-        usb_audio.set_transport(TransportMode::Wireless);
-        apply_idle_brightness(&mut display, &app_settings).context("set display brightness")?;
-        let mode = match wait_for_idle_action(
-            &button_a,
-            &button_b,
-            &mut display,
-            &mut pm1_i2c,
-            &control_socket,
-        )
-        .context("wait for idle action")?
-        {
+        let mode = match action {
             IdleAction::Record(mode) => mode,
-            IdleAction::ToggleTransport | IdleAction::SetTransport(TransportMode::Usb) => {
-                transport = TransportMode::Usb;
-                usb_audio.set_transport(TransportMode::Usb);
-                refresh_battery(&mut pm1_i2c, &mut display).context("draw battery")?;
-                apply_idle_brightness(&mut display, &app_settings)
-                    .context("set display brightness")?;
-                display.show_usb_ready().context("draw USB mic screen")?;
-                info!("transport switched to USB");
+            IdleAction::CycleMode => {
+                active_mode = active_mode.next();
+                activate_mode(
+                    active_mode,
+                    &mut wifi,
+                    &wifi_store,
+                    &mut mdns,
+                    &mut ble_audio,
+                    &mut display,
+                    &mut pm1_i2c,
+                    &usb_audio,
+                    &app_settings,
+                )?;
+                info!("mode switched to {}", active_mode.label());
+                continue;
+            }
+            IdleAction::SetMode(next) => {
+                active_mode = next;
+                activate_mode(
+                    active_mode,
+                    &mut wifi,
+                    &wifi_store,
+                    &mut mdns,
+                    &mut ble_audio,
+                    &mut display,
+                    &mut pm1_i2c,
+                    &usb_audio,
+                    &app_settings,
+                )?;
+                info!("mode switched to {}", active_mode.label());
                 continue;
             }
             IdleAction::Setup => {
@@ -328,21 +344,52 @@ fn main() -> Result<()> {
                 )?;
                 return Ok(());
             }
-            IdleAction::SetTransport(TransportMode::Wireless) => continue,
         };
+
+        if active_mode == ActiveMode::Usb {
+            continue;
+        }
         info!("recording requested: {mode:?}");
 
-        let record_result = record_once(
-            &mdns,
-            &mut cached_receiver,
-            &usb_audio,
-            &button_a,
-            &button_b,
-            &mut display,
-            &mut pm1_i2c,
-            &app_settings,
-            mode,
-        );
+        let record_result = match active_mode {
+            ActiveMode::Wifi => ensure_wifi_ready(
+                &mut wifi,
+                &wifi_store,
+                &mut mdns,
+                &mut display,
+                &app_settings,
+                &mut pm1_i2c,
+            )
+            .and_then(|()| {
+                let mdns = mdns
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("mDNS is not initialized"))?;
+                record_once_wifi(
+                    mdns,
+                    &mut cached_receiver,
+                    &usb_audio,
+                    &button_a,
+                    &button_b,
+                    &mut display,
+                    &mut pm1_i2c,
+                    &app_settings,
+                    mode,
+                )
+            }),
+            ActiveMode::Bluetooth => ensure_ble_audio(&mut ble_audio).and_then(|ble_audio| {
+                record_once_ble(
+                    ble_audio,
+                    &usb_audio,
+                    &button_a,
+                    &button_b,
+                    &mut display,
+                    &mut pm1_i2c,
+                    &app_settings,
+                    mode,
+                )
+            }),
+            ActiveMode::Usb => Ok(()),
+        };
         display
             .set_brightness(display::Brightness::Full)
             .context("set display brightness")?;
@@ -350,10 +397,17 @@ fn main() -> Result<()> {
         match record_result {
             Ok(()) => {
                 info!("recording stopped");
-                refresh_battery(&mut pm1_i2c, &mut display).context("draw battery")?;
-                apply_idle_brightness(&mut display, &app_settings)
-                    .context("set display brightness")?;
-                display.show_ready().context("draw ready screen")?;
+                activate_mode(
+                    active_mode,
+                    &mut wifi,
+                    &wifi_store,
+                    &mut mdns,
+                    &mut ble_audio,
+                    &mut display,
+                    &mut pm1_i2c,
+                    &usb_audio,
+                    &app_settings,
+                )?;
             }
             Err(err) => {
                 warn!("recording failed: {err:#}");
@@ -366,9 +420,17 @@ fn main() -> Result<()> {
         }
 
         FreeRtos::delay_ms(750);
-        refresh_battery(&mut pm1_i2c, &mut display).context("draw battery")?;
-        apply_idle_brightness(&mut display, &app_settings).context("set display brightness")?;
-        display.show_ready().context("draw ready screen")?;
+        activate_mode(
+            active_mode,
+            &mut wifi,
+            &wifi_store,
+            &mut mdns,
+            &mut ble_audio,
+            &mut display,
+            &mut pm1_i2c,
+            &usb_audio,
+            &app_settings,
+        )?;
         info!("press BtnA to start recording");
     }
 }
@@ -420,7 +482,7 @@ fn create_control_socket() -> Result<UdpSocket> {
     Ok(socket)
 }
 
-fn poll_transport_control(socket: &UdpSocket) -> Result<Option<TransportMode>> {
+fn poll_transport_control(socket: &UdpSocket) -> Result<Option<ModeCommand>> {
     let mut buf = [0u8; 64];
     let mut requested = None;
 
@@ -430,10 +492,13 @@ fn poll_transport_control(socket: &UdpSocket) -> Result<Option<TransportMode>> {
                 let payload = &buf[..len];
                 if payload == CONTROL_MODE_USB {
                     info!("mode command from {addr}: USB");
-                    requested = Some(TransportMode::Usb);
-                } else if payload == CONTROL_MODE_WIRELESS {
-                    info!("mode command from {addr}: wireless");
-                    requested = Some(TransportMode::Wireless);
+                    requested = Some(ModeCommand::SetMode(ActiveMode::Usb));
+                } else if payload == CONTROL_MODE_WIRELESS || payload == CONTROL_MODE_WIFI {
+                    info!("mode command from {addr}: Wi-Fi");
+                    requested = Some(ModeCommand::SetMode(ActiveMode::Wifi));
+                } else if payload == CONTROL_MODE_BLE {
+                    info!("mode command from {addr}: Bluetooth");
+                    requested = Some(ModeCommand::SetMode(ActiveMode::Bluetooth));
                 } else {
                     warn!("unknown mode command from {addr}");
                 }
@@ -443,6 +508,24 @@ fn poll_transport_control(socket: &UdpSocket) -> Result<Option<TransportMode>> {
             Err(err) => return Err(err).context("receive mode control"),
         }
     }
+}
+
+fn poll_mode_control(
+    socket: &UdpSocket,
+    ble_audio: Option<&ble::BleAudioServer>,
+) -> Result<Option<ModeCommand>> {
+    if let Some(command) = poll_transport_control(socket)? {
+        return Ok(Some(command));
+    }
+
+    let Some(ble_audio) = ble_audio else {
+        return Ok(None);
+    };
+    Ok(ble_audio.take_mode_command().map(|command| match command {
+        ble::BleModeCommand::Usb => ModeCommand::SetMode(ActiveMode::Usb),
+        ble::BleModeCommand::Wifi => ModeCommand::SetMode(ActiveMode::Wifi),
+        ble::BleModeCommand::Bluetooth => ModeCommand::SetMode(ActiveMode::Bluetooth),
+    }))
 }
 
 fn connect_wifi(
@@ -490,7 +573,92 @@ fn connect_wifi(
     Ok(())
 }
 
-fn record_once(
+fn ensure_wifi_ready(
+    wifi: &mut BlockingWifi<EspWifi<'static>>,
+    store: &wifi_config::WifiStore,
+    mdns: &mut Option<EspMdns>,
+    display: &mut display::StickDisplay<'_>,
+    settings: &AppSettings,
+    pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
+) -> Result<()> {
+    if mdns.is_some() {
+        return Ok(());
+    }
+
+    display
+        .show_wifi_connecting()
+        .context("draw wifi connecting")?;
+    connect_wifi(wifi, store).context("connect Wi-Fi")?;
+    *mdns = Some(start_mdns().context("start mDNS")?);
+    refresh_battery(pm1_i2c, display).context("draw battery")?;
+    apply_idle_brightness(display, settings).context("set display brightness")?;
+    display.show_ready().context("draw Wi-Fi ready screen")
+}
+
+fn start_mdns() -> Result<EspMdns> {
+    let mut mdns = EspMdns::take().context("start mdns")?;
+    mdns.set_hostname("m5sticks3-mic")
+        .context("set mdns hostname")?;
+    mdns.set_instance_name("M5StickS3 Mic")
+        .context("set mdns instance")?;
+    Ok(mdns)
+}
+
+fn ensure_ble_audio(ble_audio: &mut Option<ble::BleAudioServer>) -> Result<&ble::BleAudioServer> {
+    if ble_audio.is_none() {
+        *ble_audio = Some(ble::BleAudioServer::start().context("start Bluetooth audio server")?);
+    }
+    Ok(ble_audio
+        .as_ref()
+        .expect("Bluetooth audio server initialized"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_mode(
+    mode: ActiveMode,
+    wifi: &mut BlockingWifi<EspWifi<'static>>,
+    store: &wifi_config::WifiStore,
+    mdns: &mut Option<EspMdns>,
+    ble_audio: &mut Option<ble::BleAudioServer>,
+    display: &mut display::StickDisplay<'_>,
+    pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
+    usb_audio: &usb_audio::UsbAudio,
+    settings: &AppSettings,
+) -> Result<()> {
+    match mode {
+        ActiveMode::Wifi => {
+            usb_audio.set_transport(TransportMode::Wireless);
+            if let Err(err) = ensure_wifi_ready(wifi, store, mdns, display, settings, pm1_i2c) {
+                warn!("wifi connection failed: {err:#}");
+                apply_idle_brightness(display, settings).context("set display brightness")?;
+                display
+                    .show_error("WIFI FAIL", "HOLD B SETUP")
+                    .context("draw wifi setup hint")?;
+                return Ok(());
+            }
+            refresh_battery(pm1_i2c, display).context("draw battery")?;
+            apply_idle_brightness(display, settings).context("set display brightness")?;
+            display.show_ready().context("draw Wi-Fi ready screen")
+        }
+        ActiveMode::Bluetooth => {
+            usb_audio.set_transport(TransportMode::Wireless);
+            ensure_ble_audio(ble_audio).context("start Bluetooth audio server")?;
+            refresh_battery(pm1_i2c, display).context("draw battery")?;
+            apply_idle_brightness(display, settings).context("set display brightness")?;
+            display
+                .show_bluetooth_ready()
+                .context("draw Bluetooth ready screen")
+        }
+        ActiveMode::Usb => {
+            usb_audio.set_transport(TransportMode::Usb);
+            refresh_battery(pm1_i2c, display).context("draw battery")?;
+            apply_idle_brightness(display, settings).context("set display brightness")?;
+            display.show_usb_ready().context("draw USB mic screen")
+        }
+    }
+}
+
+fn record_once_wifi(
     mdns: &EspMdns,
     cached_receiver: &mut Option<String>,
     audio: &usb_audio::UsbAudio,
@@ -522,10 +690,10 @@ fn record_once(
     }
 
     display
-        .show_finding_receiver()
+        .show_finding_receiver(display::TransportView::Wifi)
         .context("draw finding receiver")?;
     let server_url = discovery::discover_server(mdns, |phase| {
-        if let Err(err) = display.show_finding_receiver_phase(phase) {
+        if let Err(err) = display.show_finding_receiver_phase(display::TransportView::Wifi, phase) {
             warn!("failed to animate receiver discovery: {err:#}");
         }
     })
@@ -542,6 +710,41 @@ fn record_once(
         *cached_receiver = None;
     }
     result
+}
+
+fn record_once_ble(
+    ble_audio: &ble::BleAudioServer,
+    audio: &usb_audio::UsbAudio,
+    button_a: &PinDriver<Input>,
+    button_b: &PinDriver<Input>,
+    display: &mut display::StickDisplay<'_>,
+    pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
+    settings: &AppSettings,
+    mode: RecordMode,
+) -> Result<()> {
+    display
+        .show_finding_receiver(display::TransportView::Bluetooth)
+        .context("draw finding Bluetooth receiver")?;
+    for phase in 0..120 {
+        if ble_audio.is_ready() {
+            info!("Bluetooth receiver connected");
+            ble_audio.set_status(b"connected");
+            return stream_audio_ble(
+                ble_audio, audio, button_a, button_b, display, pm1_i2c, settings, mode,
+            );
+        }
+        if should_stop_stream(mode, button_a) {
+            return Ok(());
+        }
+        if let Err(err) =
+            display.show_finding_receiver_phase(display::TransportView::Bluetooth, phase)
+        {
+            warn!("failed to animate Bluetooth receiver discovery: {err:#}");
+        }
+        FreeRtos::delay_ms(100);
+    }
+
+    Err(anyhow!("Bluetooth receiver is not connected"))
 }
 
 fn connect_audio(server_url: &str) -> Result<EspWebSocketClient<'static>> {
@@ -605,7 +808,12 @@ fn stream_audio_connected(
         .set_brightness(brightness)
         .context("set recording brightness")?;
     display
-        .show_recording(0, mode.display_mode(), live_meters)
+        .show_recording(
+            display::TransportView::Wifi,
+            0,
+            mode.display_mode(),
+            live_meters,
+        )
         .context("draw recording screen")?;
     if live_meters {
         display
@@ -614,6 +822,8 @@ fn stream_audio_connected(
     }
 
     let stream_id = next_stream_id();
+    let wireless_codec = settings.wireless_codec.protocol_codec();
+    info!("wireless audio codec: {}", wireless_codec.as_str());
     let (tx, rx) = sync_channel::<CapturedFrame>(AUDIO_BUFFER_FRAMES);
     let stop_capture = AtomicBool::new(false);
     let queued_frames = AtomicUsize::new(0);
@@ -632,6 +842,7 @@ fn stream_audio_connected(
                     &queued_frames,
                     stream_id,
                     mode,
+                    wireless_codec,
                     &track_level,
                 )
             })
@@ -675,9 +886,132 @@ fn stream_audio_connected(
     })?;
 
     if have_sent_audio && client.is_connected() {
-        send_stream_end(&mut client, stream_id, last_sequence.wrapping_add(1), mode)
-            .context("send stream end")?;
+        send_stream_end(
+            &mut client,
+            stream_id,
+            last_sequence.wrapping_add(1),
+            mode,
+            wireless_codec,
+        )
+        .context("send stream end")?;
     }
+
+    match stop_reason {
+        StreamStop::User => Ok(()),
+        StreamStop::CaptureEnded => Err(anyhow!("audio capture ended")),
+    }
+}
+
+fn stream_audio_ble(
+    ble_audio: &ble::BleAudioServer,
+    audio: &usb_audio::UsbAudio,
+    button_a: &PinDriver<Input>,
+    button_b: &PinDriver<Input>,
+    display: &mut display::StickDisplay<'_>,
+    pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
+    settings: &AppSettings,
+    mode: RecordMode,
+) -> Result<()> {
+    drain_i2s(audio, DRAIN_FRAMES).context("drain pre-stream audio")?;
+    refresh_battery(pm1_i2c, display).context("draw battery")?;
+    let power_save_recording = !display.external_power() && settings.recording_battery_saver;
+    let live_meters = !power_save_recording;
+    let track_level = AtomicBool::new(live_meters);
+    let brightness = display_brightness_for_power(display, settings);
+    display
+        .set_brightness(brightness)
+        .context("set recording brightness")?;
+    display
+        .show_recording(
+            display::TransportView::Bluetooth,
+            0,
+            mode.display_mode(),
+            live_meters,
+        )
+        .context("draw recording screen")?;
+    if live_meters {
+        display
+            .update_buffer(0, AUDIO_BUFFER_FRAMES)
+            .context("draw buffer meter")?;
+    }
+
+    let stream_id = next_stream_id();
+    let wireless_codec = Codec::ImaAdpcm4;
+    ble_audio.set_status(b"recording");
+    info!("Bluetooth audio codec: {}", wireless_codec.as_str());
+
+    let (tx, rx) = sync_channel::<CapturedFrame>(AUDIO_BUFFER_FRAMES);
+    let stop_capture = AtomicBool::new(false);
+    let queued_frames = AtomicUsize::new(0);
+    let mut last_sequence = 0u32;
+    let mut have_sent_audio = false;
+
+    let stop_reason = thread::scope(|scope| -> Result<StreamStop> {
+        let capture_handle = thread::Builder::new()
+            .name("m5mic-capture".to_string())
+            .stack_size(CAPTURE_THREAD_STACK)
+            .spawn_scoped(scope, || {
+                capture_audio_frames(
+                    audio,
+                    tx,
+                    &stop_capture,
+                    &queued_frames,
+                    stream_id,
+                    mode,
+                    wireless_codec,
+                    &track_level,
+                )
+            })
+            .map_err(|err| anyhow!("spawn audio capture thread: {err}"))?;
+
+        let send_result = send_captured_audio_ble(
+            ble_audio,
+            rx,
+            &queued_frames,
+            button_a,
+            button_b,
+            display,
+            pm1_i2c,
+            mode,
+            &track_level,
+            live_meters,
+            power_save_recording,
+            settings,
+            &mut last_sequence,
+            &mut have_sent_audio,
+        );
+
+        stop_capture.store(true, Ordering::Relaxed);
+        let capture_result = capture_handle
+            .join()
+            .map_err(|_| anyhow!("audio capture thread panicked"))?;
+
+        match (send_result, capture_result) {
+            (Ok(StreamStop::User), Err(err)) => {
+                warn!("audio capture stopped after user stop: {err:#}");
+                Ok(StreamStop::User)
+            }
+            (Ok(stop), Ok(())) => Ok(stop),
+            (Ok(StreamStop::CaptureEnded), Err(err)) => Err(err.context("audio capture")),
+            (Err(err), Ok(())) => Err(err),
+            (Err(err), Err(capture_err)) => {
+                warn!("audio capture also failed: {capture_err:#}");
+                Err(err)
+            }
+        }
+    })?;
+
+    if have_sent_audio && ble_audio.is_ready() {
+        send_stream_end_ble(
+            ble_audio,
+            stream_id,
+            last_sequence.wrapping_add(1),
+            mode,
+            wireless_codec,
+        )
+        .context("send Bluetooth stream end")?;
+    }
+    ble_audio.set_status(b"idle");
 
     match stop_reason {
         StreamStop::User => Ok(()),
@@ -692,29 +1026,46 @@ fn capture_audio_frames(
     queued_frames: &AtomicUsize,
     stream_id: u32,
     mode: RecordMode,
+    codec: Codec,
     track_level: &AtomicBool,
 ) -> Result<()> {
     let mut sequence = 0u32;
     let mut first = true;
+    let mut pcm = [0u8; PCM_BYTES];
+    let mut adpcm_state = ImaAdpcmState::new();
 
     while !stop_capture.load(Ordering::Relaxed) {
         let mut frame = CapturedFrame::new(sequence);
-        audio.read_exact(&mut frame.bytes[HEADER_LEN..])?;
+        audio.read_exact(&mut pcm)?;
         if track_level.load(Ordering::Relaxed) {
-            frame.level = pcm_peak_percent(&frame.bytes[HEADER_LEN..]);
+            frame.level = pcm_peak_percent(&pcm);
         }
 
         let mut flags = mode_flags(mode);
         if first {
             flags |= FLAG_STREAM_START;
         }
+        let payload_len = match codec {
+            Codec::PcmS16Le => {
+                frame.bytes[HEADER_LEN..HEADER_LEN + PCM_BYTES].copy_from_slice(&pcm);
+                PCM_BYTES
+            }
+            Codec::ImaAdpcm4 => ima_adpcm4_encode(
+                &pcm,
+                &mut frame.bytes[HEADER_LEN..HEADER_LEN + ADPCM_BYTES],
+                &mut adpcm_state,
+            )
+            .map_err(|err| anyhow!("encode adpcm frame: {err:?}"))?,
+        };
+        frame.len = HEADER_LEN + payload_len;
+
         let header = AudioFrameHeader::new(
-            Codec::PcmS16Le,
+            codec,
             CHANNELS,
             SAMPLE_RATE,
             sequence,
             esp_timer_us(),
-            PCM_BYTES as u16,
+            payload_len as u16,
             stream_id,
             flags,
         );
@@ -776,7 +1127,12 @@ fn send_captured_audio(
                     .set_brightness(display_brightness_for_power(display, settings))
                     .context("turn recording display on")?;
                 display
-                    .show_recording(elapsed_secs, mode.display_mode(), false)
+                    .show_recording(
+                        display::TransportView::Wifi,
+                        elapsed_secs,
+                        mode.display_mode(),
+                        false,
+                    )
                     .context("redraw recording screen")?;
                 last_elapsed_secs = elapsed_secs;
             }
@@ -789,7 +1145,7 @@ fn send_captured_audio(
                     return Err(anyhow!("websocket disconnected"));
                 }
                 client
-                    .send(FrameType::Binary(false), &frame.bytes)
+                    .send(FrameType::Binary(false), &frame.bytes[..frame.len])
                     .context("send audio frame")?;
                 *last_sequence = frame.sequence;
                 *have_sent_audio = true;
@@ -842,7 +1198,159 @@ fn send_captured_audio(
                 }
                 if !display_off {
                     display
-                        .show_recording(elapsed_secs, mode.display_mode(), live_meters)
+                        .show_recording(
+                            display::TransportView::Wifi,
+                            elapsed_secs,
+                            mode.display_mode(),
+                            live_meters,
+                        )
+                        .context("redraw recording screen")?;
+                    last_elapsed_secs = elapsed_secs;
+                }
+                last_buffer_frames = usize::MAX;
+            }
+
+            next_battery_refresh_us = now_us.saturating_add(RECORDING_POWER_REFRESH_US);
+        }
+        if live_meters && !display_off && now_us >= next_level_refresh_us {
+            display
+                .update_level(meter_level)
+                .context("draw recording level")?;
+            next_level_refresh_us = now_us.saturating_add(LEVEL_REFRESH_US);
+        }
+
+        if live_meters && !display_off {
+            let buffered = queued_frames
+                .load(Ordering::Relaxed)
+                .min(AUDIO_BUFFER_FRAMES);
+            if buffered != last_buffer_frames {
+                display
+                    .update_buffer(buffered, AUDIO_BUFFER_FRAMES)
+                    .context("draw buffer meter")?;
+                last_buffer_frames = buffered;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_captured_audio_ble(
+    ble_audio: &ble::BleAudioServer,
+    rx: Receiver<CapturedFrame>,
+    queued_frames: &AtomicUsize,
+    button_a: &PinDriver<Input>,
+    button_b: &PinDriver<Input>,
+    display: &mut display::StickDisplay<'_>,
+    pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
+    mode: RecordMode,
+    track_level: &AtomicBool,
+    mut live_meters: bool,
+    mut power_save_recording: bool,
+    settings: &AppSettings,
+    last_sequence: &mut u32,
+    have_sent_audio: &mut bool,
+) -> Result<StreamStop> {
+    let started_us = esp_timer_us();
+    let mut last_elapsed_secs = 0;
+    let mut next_battery_refresh_us = started_us.saturating_add(RECORDING_POWER_REFRESH_US);
+    let mut next_level_refresh_us = started_us.saturating_add(LEVEL_REFRESH_US);
+    let mut meter_level = 0u8;
+    let mut last_buffer_frames = usize::MAX;
+    let mut display_off = false;
+
+    loop {
+        if should_stop_stream(mode, button_a) {
+            return Ok(StreamStop::User);
+        }
+        if power_save_recording && consume_button_press(button_b) {
+            display_off = !display_off;
+            if display_off {
+                display
+                    .set_brightness(display::Brightness::Off)
+                    .context("turn recording display off")?;
+            } else {
+                let elapsed_secs = esp_timer_us().saturating_sub(started_us) / 1_000_000;
+                display
+                    .set_brightness(display_brightness_for_power(display, settings))
+                    .context("turn recording display on")?;
+                display
+                    .show_recording(
+                        display::TransportView::Bluetooth,
+                        elapsed_secs,
+                        mode.display_mode(),
+                        false,
+                    )
+                    .context("redraw recording screen")?;
+                last_elapsed_secs = elapsed_secs;
+            }
+        }
+
+        match rx.recv_timeout(Duration::from_millis(40)) {
+            Ok(frame) => {
+                decrement_queued_frames(queued_frames);
+                if !ble_audio.is_ready() {
+                    return Err(anyhow!("Bluetooth receiver disconnected"));
+                }
+                ble_audio
+                    .notify_frame(frame.sequence, &frame.bytes[..frame.len])
+                    .context("send Bluetooth audio frame")?;
+                *last_sequence = frame.sequence;
+                *have_sent_audio = true;
+
+                meter_level = if frame.level > meter_level {
+                    frame.level
+                } else {
+                    meter_level.saturating_sub(8).max(frame.level)
+                };
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok(StreamStop::CaptureEnded),
+        }
+
+        let now_us = esp_timer_us();
+        let elapsed_secs = now_us.saturating_sub(started_us) / 1_000_000;
+        if !display_off && elapsed_secs != last_elapsed_secs {
+            display
+                .update_recording_time(elapsed_secs)
+                .context("draw recording time")?;
+            last_elapsed_secs = elapsed_secs;
+        }
+        if now_us >= next_battery_refresh_us {
+            if display_off {
+                display.set_battery(read_battery_view(pm1_i2c));
+            } else {
+                refresh_battery(pm1_i2c, display).context("draw battery")?;
+            }
+            let external_power = display.external_power();
+            if external_power {
+                display_off = false;
+            }
+            let next_power_save_recording = !external_power && settings.recording_battery_saver;
+            let next_live_meters = !next_power_save_recording;
+            display
+                .set_brightness(if display_off {
+                    display::Brightness::Off
+                } else {
+                    display_brightness_for_power(display, settings)
+                })
+                .context("set recording brightness")?;
+
+            if next_power_save_recording != power_save_recording || next_live_meters != live_meters
+            {
+                power_save_recording = next_power_save_recording;
+                live_meters = next_live_meters;
+                track_level.store(live_meters, Ordering::Relaxed);
+                if !live_meters {
+                    meter_level = 0;
+                }
+                if !display_off {
+                    display
+                        .show_recording(
+                            display::TransportView::Bluetooth,
+                            elapsed_secs,
+                            mode.display_mode(),
+                            live_meters,
+                        )
                         .context("redraw recording screen")?;
                     last_elapsed_secs = elapsed_secs;
                 }
@@ -884,10 +1392,11 @@ fn send_stream_end(
     stream_id: u32,
     sequence: u32,
     mode: RecordMode,
+    codec: Codec,
 ) -> Result<()> {
     let mut frame = [0u8; HEADER_LEN];
     let header = AudioFrameHeader::new(
-        Codec::PcmS16Le,
+        codec,
         CHANNELS,
         SAMPLE_RATE,
         sequence,
@@ -902,6 +1411,32 @@ fn send_stream_end(
     client
         .send(FrameType::Binary(false), &frame)
         .context("send stream end frame")
+}
+
+fn send_stream_end_ble(
+    ble_audio: &ble::BleAudioServer,
+    stream_id: u32,
+    sequence: u32,
+    mode: RecordMode,
+    codec: Codec,
+) -> Result<()> {
+    let mut frame = [0u8; HEADER_LEN];
+    let header = AudioFrameHeader::new(
+        codec,
+        CHANNELS,
+        SAMPLE_RATE,
+        sequence,
+        esp_timer_us(),
+        0,
+        stream_id,
+        FLAG_STREAM_END | mode_flags(mode),
+    );
+    header
+        .encode_into(&mut frame)
+        .map_err(|err| anyhow!("encode Bluetooth stream end frame: {err:?}"))?;
+    ble_audio
+        .notify_frame(sequence, &frame)
+        .context("send Bluetooth stream end frame")
 }
 
 fn mode_flags(mode: RecordMode) -> u16 {
@@ -1017,6 +1552,7 @@ fn wait_for_idle_action(
     display: &mut display::StickDisplay<'_>,
     pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
     control_socket: &UdpSocket,
+    ble_audio: Option<&ble::BleAudioServer>,
 ) -> Result<IdleAction> {
     let mut next_battery_refresh_us = esp_timer_us().saturating_add(BATTERY_REFRESH_US);
     loop {
@@ -1025,13 +1561,13 @@ fn wait_for_idle_action(
         }
         if let Some(action) = consume_button_b_action(button_b) {
             return Ok(match action {
-                ButtonBAction::ToggleTransport => IdleAction::ToggleTransport,
+                ButtonBAction::CycleMode => IdleAction::CycleMode,
                 ButtonBAction::Setup => IdleAction::Setup,
             });
         }
-        if let Some(transport) = poll_transport_control(control_socket)? {
-            if transport != TransportMode::Wireless {
-                return Ok(IdleAction::SetTransport(transport));
+        if let Some(command) = poll_mode_control(control_socket, ble_audio)? {
+            match command {
+                ModeCommand::SetMode(mode) => return Ok(IdleAction::SetMode(mode)),
             }
         }
 
@@ -1051,6 +1587,7 @@ fn wait_for_usb_action(
     pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
     audio: &usb_audio::UsbAudio,
     control_socket: &UdpSocket,
+    ble_audio: Option<&ble::BleAudioServer>,
 ) -> Result<IdleAction> {
     let mut next_battery_refresh_us = esp_timer_us().saturating_add(BATTERY_REFRESH_US);
     let mut next_level_refresh_us = esp_timer_us().saturating_add(LEVEL_REFRESH_US);
@@ -1059,13 +1596,16 @@ fn wait_for_usb_action(
     loop {
         if let Some(action) = consume_button_b_action(button_b) {
             return Ok(match action {
-                ButtonBAction::ToggleTransport => IdleAction::ToggleTransport,
+                ButtonBAction::CycleMode => IdleAction::CycleMode,
                 ButtonBAction::Setup => IdleAction::Setup,
             });
         }
-        if let Some(transport) = poll_transport_control(control_socket)? {
-            if transport != TransportMode::Usb {
-                return Ok(IdleAction::SetTransport(transport));
+        if let Some(command) = poll_mode_control(control_socket, ble_audio)? {
+            match command {
+                ModeCommand::SetMode(ActiveMode::Usb) => {}
+                ModeCommand::SetMode(mode) => {
+                    return Ok(IdleAction::SetMode(mode));
+                }
             }
         }
 
@@ -1110,16 +1650,6 @@ fn consume_record_request(button: &PinDriver<Input>) -> Option<RecordMode> {
     Some(RecordMode::Latched)
 }
 
-fn wait_for_setup_hold(button: &PinDriver<Input>) {
-    loop {
-        if button_held(button, SETUP_IDLE_HOLD_MS) {
-            wait_for_button_release(button);
-            return;
-        }
-        FreeRtos::delay_ms(20);
-    }
-}
-
 fn consume_button_b_action(button: &PinDriver<Input>) -> Option<ButtonBAction> {
     if !button.is_low() {
         return None;
@@ -1141,7 +1671,7 @@ fn consume_button_b_action(button: &PinDriver<Input>) -> Option<ButtonBAction> {
     }
 
     FreeRtos::delay_ms(30);
-    Some(ButtonBAction::ToggleTransport)
+    Some(ButtonBAction::CycleMode)
 }
 
 fn button_held(button: &PinDriver<Input>, hold_ms: u32) -> bool {

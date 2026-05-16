@@ -1,3 +1,5 @@
+mod ble;
+
 use std::{
     collections::BTreeSet,
     ffi::CStr,
@@ -14,10 +16,14 @@ use clap::Parser;
 use coreaudio_sys::*;
 use if_addrs::{get_if_addrs, IfAddr};
 use m5mic_protocol::{
-    CONTROL_MODE_USB, CONTROL_MODE_WIRELESS, CONTROL_PORT, DISCOVERY_PORT, WS_PORT,
+    CONTROL_MODE_BLE, CONTROL_MODE_USB, CONTROL_MODE_WIFI, CONTROL_PORT, DISCOVERY_PORT, WS_PORT,
 };
 use m5mic_receiver::{run, ReceiverConfig, ReceiverStatus};
-use tokio::{runtime::Runtime, sync::watch, time};
+use tokio::{
+    runtime::{Handle, Runtime},
+    sync::watch,
+    time,
+};
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
     Icon, TrayIconBuilder,
@@ -51,6 +57,7 @@ struct Args {
 enum UserEvent {
     Menu(MenuEvent),
     Status(ReceiverStatus),
+    Ble(ble::BleReceiverStatus),
     Usb(UsbStatus),
     Driver(DriverStatus),
     DriverInstall(DriverInstallResult),
@@ -79,14 +86,16 @@ enum DriverInstallResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InputMode {
-    Wireless,
+    Wifi,
+    Bluetooth,
     Usb,
 }
 
 impl InputMode {
     const fn menu_label(self) -> &'static str {
         match self {
-            Self::Wireless => "wireless",
+            Self::Wifi => "Wi-Fi",
+            Self::Bluetooth => "Bluetooth",
             Self::Usb => "USB",
         }
     }
@@ -101,7 +110,9 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     let runtime = Runtime::new().context("start tokio runtime")?;
+    let runtime_handle = runtime.handle().clone();
     let (status_tx, status_rx) = watch::channel(ReceiverStatus::Starting);
+    let (ble_status_tx, ble_status_rx) = watch::channel(ble::BleReceiverStatus::Starting);
 
     let config = ReceiverConfig {
         listen: args.listen,
@@ -118,6 +129,7 @@ fn main() -> Result<()> {
             let _ = receiver_status_tx.send(ReceiverStatus::Error(err.to_string()));
         }
     });
+    runtime.spawn(ble::run(ble_status_tx));
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
@@ -141,6 +153,19 @@ fn main() -> Result<()> {
                     break;
                 }
                 let _ = proxy.send_event(UserEvent::Status(status_rx.borrow().clone()));
+            }
+        }
+    });
+
+    runtime.spawn({
+        let proxy = proxy.clone();
+        async move {
+            let mut ble_status_rx = ble_status_rx;
+            loop {
+                if ble_status_rx.changed().await.is_err() {
+                    break;
+                }
+                let _ = proxy.send_event(UserEvent::Ble(ble_status_rx.borrow().clone()));
             }
         }
     });
@@ -182,7 +207,9 @@ fn main() -> Result<()> {
     let install_driver_item =
         MenuItem::with_id("install-driver", "Install Audio Driver...", true, None);
     let usb_status_item = MenuItem::new("USB: checking", false, None);
-    let wireless_mode_item = MenuItem::with_id("mode-wireless", "Use Wireless Mode", true, None);
+    let bluetooth_status_item = MenuItem::new("Bluetooth: starting", false, None);
+    let wifi_mode_item = MenuItem::with_id("mode-wifi", "Use Wi-Fi Mode", true, None);
+    let bluetooth_mode_item = MenuItem::with_id("mode-bluetooth", "Use Bluetooth Mode", true, None);
     let usb_mode_item = MenuItem::with_id("mode-usb", "Use USB Mode", true, None);
     let settings_item = MenuItem::with_id("sound-settings", "Open Sound Settings", true, None);
     let quit_item = MenuItem::with_id("quit", "Quit m5mic", true, None);
@@ -195,8 +222,12 @@ fn main() -> Result<()> {
         .context("add driver install menu item")?;
     menu.append(&usb_status_item)
         .context("add USB status menu item")?;
-    menu.append(&wireless_mode_item)
-        .context("add wireless mode menu item")?;
+    menu.append(&bluetooth_status_item)
+        .context("add Bluetooth status menu item")?;
+    menu.append(&wifi_mode_item)
+        .context("add Wi-Fi mode menu item")?;
+    menu.append(&bluetooth_mode_item)
+        .context("add Bluetooth mode menu item")?;
 
     let mut usb_mode_visible = matches!(initial_usb_status, UsbStatus::Connected);
     if usb_mode_visible {
@@ -209,6 +240,8 @@ fn main() -> Result<()> {
     menu.append(&quit_item).context("add quit menu item")?;
     let menu_handle = menu.clone();
     let mut current_driver_status = initial_driver_status;
+    let mut latest_receiver_status = ReceiverStatus::Starting;
+    let mut latest_ble_status = ble::BleReceiverStatus::Starting;
     let mut driver_install_running = false;
     let mut driver_install_prompted = false;
     sync_driver_menu(
@@ -242,12 +275,26 @@ fn main() -> Result<()> {
     #[allow(deprecated)]
     let run_result = event_loop.run(move |event, event_loop| match event {
         Event::UserEvent(UserEvent::Status(status)) => {
-            let text = status_text(&status);
-            status_item.set_text(format!("Status: {text}"));
-            let _ = tray.set_tooltip(Some(format!("m5mic: {text}")));
-            let _ = tray.set_icon(Some(
-                icon_for_status(&status).unwrap_or_else(|_| fallback_icon()),
+            latest_receiver_status = status;
+            sync_status_menu(
+                &status_item,
+                &tray,
+                &latest_receiver_status,
+                &latest_ble_status,
+            );
+        }
+        Event::UserEvent(UserEvent::Ble(status)) => {
+            latest_ble_status = status;
+            bluetooth_status_item.set_text(format!(
+                "Bluetooth: {}",
+                bluetooth_status_text(&latest_ble_status)
             ));
+            sync_status_menu(
+                &status_item,
+                &tray,
+                &latest_receiver_status,
+                &latest_ble_status,
+            );
         }
         Event::UserEvent(UserEvent::Usb(status)) => {
             usb_status_item.set_text(format!("USB: {}", usb_status_text(status)));
@@ -301,10 +348,15 @@ fn main() -> Result<()> {
                 open_sound_settings();
             } else if event.id == MenuId::from("quit") {
                 event_loop.exit();
-            } else if event.id == MenuId::from("mode-wireless") {
-                set_menu_input_mode(InputMode::Wireless, &status_item);
+            } else if event.id == MenuId::from("mode-wifi") {
+                set_menu_input_mode(InputMode::Wifi, &status_item);
+                spawn_ble_mode_command(&runtime_handle, InputMode::Wifi);
+            } else if event.id == MenuId::from("mode-bluetooth") {
+                set_menu_input_mode(InputMode::Bluetooth, &status_item);
+                spawn_ble_mode_command(&runtime_handle, InputMode::Bluetooth);
             } else if event.id == MenuId::from("mode-usb") {
                 set_menu_input_mode(InputMode::Usb, &status_item);
+                spawn_ble_mode_command(&runtime_handle, InputMode::Usb);
             } else if event.id == MenuId::from("install-driver") && !driver_install_running {
                 driver_install_running = true;
                 status_item.set_text("Status: installing audio driver");
@@ -333,6 +385,52 @@ fn status_text(status: &ReceiverStatus) -> String {
         ReceiverStatus::Receiving { stream_id } => format!("recording {stream_id:08x}"),
         ReceiverStatus::Stopped => "stopped".to_string(),
         ReceiverStatus::Error(err) => format!("error: {err}"),
+    }
+}
+
+fn bluetooth_status_text(status: &ble::BleReceiverStatus) -> String {
+    match status {
+        ble::BleReceiverStatus::Starting => "starting".to_string(),
+        ble::BleReceiverStatus::Scanning => "scanning".to_string(),
+        ble::BleReceiverStatus::Connecting => "connecting".to_string(),
+        ble::BleReceiverStatus::Connected => "connected".to_string(),
+        ble::BleReceiverStatus::Receiving { stream_id } => format!("recording {stream_id:08x}"),
+        ble::BleReceiverStatus::Error(err) => format!("error: {err}"),
+    }
+}
+
+fn sync_status_menu(
+    status_item: &MenuItem,
+    tray: &tray_icon::TrayIcon,
+    receiver_status: &ReceiverStatus,
+    ble_status: &ble::BleReceiverStatus,
+) {
+    let text = if matches!(ble_status, ble::BleReceiverStatus::Receiving { .. }) {
+        format!("Bluetooth {}", bluetooth_status_text(ble_status))
+    } else {
+        status_text(receiver_status)
+    };
+    status_item.set_text(format!("Status: {text}"));
+    let _ = tray.set_tooltip(Some(format!("m5mic: {text}")));
+    let _ = tray.set_icon(Some(
+        icon_for_combined_status(receiver_status, ble_status).unwrap_or_else(|_| fallback_icon()),
+    ));
+}
+
+fn icon_for_combined_status(
+    receiver_status: &ReceiverStatus,
+    ble_status: &ble::BleReceiverStatus,
+) -> Result<Icon> {
+    if matches!(receiver_status, ReceiverStatus::Receiving { .. })
+        || matches!(ble_status, ble::BleReceiverStatus::Receiving { .. })
+    {
+        make_recording_icon()
+    } else if matches!(receiver_status, ReceiverStatus::Error(_))
+        || matches!(ble_status, ble::BleReceiverStatus::Error(_))
+    {
+        make_error_icon()
+    } else {
+        make_idle_icon()
     }
 }
 
@@ -542,7 +640,7 @@ fn sync_usb_mode_item(
     }
 
     let result = if should_show {
-        menu.insert(usb_mode_item, 5)
+        menu.insert(usb_mode_item, 7)
     } else {
         menu.remove(usb_mode_item)
     };
@@ -572,7 +670,7 @@ fn switch_input_mode(mode: InputMode) -> Result<()> {
 
 fn find_m5mic_input(mode: InputMode) -> Result<AudioObjectID> {
     let target_transport = match mode {
-        InputMode::Wireless => kAudioDeviceTransportTypeVirtual,
+        InputMode::Wifi | InputMode::Bluetooth => kAudioDeviceTransportTypeVirtual,
         InputMode::Usb => kAudioDeviceTransportTypeUSB,
     };
 
@@ -607,7 +705,8 @@ fn set_default_input_device(device_id: AudioObjectID) -> Result<()> {
 
 fn send_device_mode(mode: InputMode) -> Result<()> {
     let payload = match mode {
-        InputMode::Wireless => CONTROL_MODE_WIRELESS,
+        InputMode::Wifi => CONTROL_MODE_WIFI,
+        InputMode::Bluetooth => CONTROL_MODE_BLE,
         InputMode::Usb => CONTROL_MODE_USB,
     };
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
@@ -625,6 +724,19 @@ fn send_device_mode(mode: InputMode) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn spawn_ble_mode_command(runtime: &Handle, mode: InputMode) {
+    let payload = match mode {
+        InputMode::Wifi => CONTROL_MODE_WIFI,
+        InputMode::Bluetooth => CONTROL_MODE_BLE,
+        InputMode::Usb => CONTROL_MODE_USB,
+    };
+    runtime.spawn(async move {
+        if let Err(err) = ble::send_mode_command(payload).await {
+            tracing::debug!(?err, ?mode, "Bluetooth mode command failed");
+        }
+    });
 }
 
 fn mode_control_targets() -> Vec<SocketAddrV4> {
