@@ -24,6 +24,13 @@ if [[ -z "$sign_identity" ]]; then
   done < <(security find-identity -v -p codesigning 2>/dev/null || true)
 fi
 
-codesign --force --sign "$sign_identity" --timestamp=none "$bundle" >/dev/null
+sign_args=(--force --sign "$sign_identity")
+if [[ "$sign_identity" == "-" ]]; then
+  sign_args+=(--timestamp=none)
+else
+  sign_args+=(--timestamp --options runtime)
+fi
+
+codesign "${sign_args[@]}" "$bundle" >/dev/null
 
 echo "$bundle"

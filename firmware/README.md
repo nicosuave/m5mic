@@ -24,7 +24,7 @@ Flash:
 espflash flash --port <serial-port> target/xtensa-esp32s3-espidf/release/m5mic-firmware
 ```
 
-Short-tap BtnB to toggle between wireless mode and USB Audio Class mic mode. In USB mode, no receiver is required. On macOS, it lists as `m5mic` from manufacturer `M5Stack`, 1 channel at 16 kHz.
+Short-tap BtnB to toggle between wireless mode and USB Audio Class mic mode. The status-bar app can also switch modes by sending a UDP command on port `47779`. In USB mode, no receiver is required. On macOS, it lists as `m5mic` from manufacturer `M5Stack`, 1 channel at 16 kHz.
 
 In wireless mode, the firmware discovers the receiver in this order:
 

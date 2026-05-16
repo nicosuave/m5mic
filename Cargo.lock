@@ -1837,6 +1837,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "coreaudio-sys",
  "m5mic-protocol",
  "m5mic-receiver",
  "tokio",

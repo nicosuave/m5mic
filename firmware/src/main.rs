@@ -9,6 +9,8 @@ mod usb_audio;
 mod wifi_config;
 
 use std::{
+    io::ErrorKind,
+    net::{Ipv4Addr, SocketAddrV4, UdpSocket},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender},
@@ -36,7 +38,8 @@ use esp_idf_svc::{
 };
 use log::{info, warn};
 use m5mic_protocol::{
-    AudioFrameHeader, Codec, FLAG_PUSH_TO_TALK, FLAG_STREAM_END, FLAG_STREAM_START, HEADER_LEN,
+    AudioFrameHeader, Codec, CONTROL_MODE_USB, CONTROL_MODE_WIRELESS, CONTROL_PORT,
+    FLAG_PUSH_TO_TALK, FLAG_STREAM_END, FLAG_STREAM_START, HEADER_LEN,
 };
 use usb_audio::TransportMode;
 
@@ -60,6 +63,7 @@ enum IdleAction {
     Record(RecordMode),
     Setup,
     ToggleTransport,
+    SetTransport(TransportMode),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,6 +214,7 @@ fn main() -> Result<()> {
     let usb_audio = usb_audio::UsbAudio::new(i2s).context("start USB audio")?;
     usb_audio.set_transport(TransportMode::Wireless);
     drain_i2s(&usb_audio, DRAIN_FRAMES).context("drain startup audio")?;
+    let control_socket = create_control_socket().context("start mode control socket")?;
 
     info!("press BtnA to start recording");
     let mut cached_receiver = None;
@@ -218,10 +223,16 @@ fn main() -> Result<()> {
         if transport == TransportMode::Usb {
             usb_audio.set_transport(TransportMode::Usb);
             display.show_usb_ready().context("draw USB mic screen")?;
-            match wait_for_usb_action(&button_b, &mut display, &mut pm1_i2c, &usb_audio)
-                .context("wait for USB mode action")?
+            match wait_for_usb_action(
+                &button_b,
+                &mut display,
+                &mut pm1_i2c,
+                &usb_audio,
+                &control_socket,
+            )
+            .context("wait for USB mode action")?
             {
-                IdleAction::ToggleTransport => {
+                IdleAction::ToggleTransport | IdleAction::SetTransport(TransportMode::Wireless) => {
                     transport = TransportMode::Wireless;
                     usb_audio.set_transport(TransportMode::Wireless);
                     refresh_battery(&mut pm1_i2c, &mut display).context("draw battery")?;
@@ -234,15 +245,22 @@ fn main() -> Result<()> {
                     setup::run(&mut wifi, wifi_store.clone(), &mut display, &setup_ssid)?;
                     return Ok(());
                 }
+                IdleAction::SetTransport(TransportMode::Usb) => continue,
                 IdleAction::Record(_) => continue,
             }
         }
 
-        let mode = match wait_for_idle_action(&button_a, &button_b, &mut display, &mut pm1_i2c)
-            .context("wait for idle action")?
+        let mode = match wait_for_idle_action(
+            &button_a,
+            &button_b,
+            &mut display,
+            &mut pm1_i2c,
+            &control_socket,
+        )
+        .context("wait for idle action")?
         {
             IdleAction::Record(mode) => mode,
-            IdleAction::ToggleTransport => {
+            IdleAction::ToggleTransport | IdleAction::SetTransport(TransportMode::Usb) => {
                 transport = TransportMode::Usb;
                 usb_audio.set_transport(TransportMode::Usb);
                 refresh_battery(&mut pm1_i2c, &mut display).context("draw battery")?;
@@ -255,6 +273,7 @@ fn main() -> Result<()> {
                 setup::run(&mut wifi, wifi_store.clone(), &mut display, &setup_ssid)?;
                 return Ok(());
             }
+            IdleAction::SetTransport(TransportMode::Wireless) => continue,
         };
         info!("recording requested: {mode:?}");
 
@@ -323,6 +342,40 @@ fn log_i2c_devices(label: &str, bus: &i2c_bus::I2cBus) -> usize {
         }
     }
     count
+}
+
+fn create_control_socket() -> Result<UdpSocket> {
+    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, CONTROL_PORT))
+        .context("bind mode control socket")?;
+    socket
+        .set_nonblocking(true)
+        .context("set mode control nonblocking")?;
+    Ok(socket)
+}
+
+fn poll_transport_control(socket: &UdpSocket) -> Result<Option<TransportMode>> {
+    let mut buf = [0u8; 64];
+    let mut requested = None;
+
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((len, addr)) => {
+                let payload = &buf[..len];
+                if payload == CONTROL_MODE_USB {
+                    info!("mode command from {addr}: USB");
+                    requested = Some(TransportMode::Usb);
+                } else if payload == CONTROL_MODE_WIRELESS {
+                    info!("mode command from {addr}: wireless");
+                    requested = Some(TransportMode::Wireless);
+                } else {
+                    warn!("unknown mode command from {addr}");
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => return Ok(requested),
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err).context("receive mode control"),
+        }
+    }
 }
 
 fn connect_wifi(
@@ -779,6 +832,7 @@ fn wait_for_idle_action(
     button_b: &PinDriver<Input>,
     display: &mut display::StickDisplay<'_>,
     pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
+    control_socket: &UdpSocket,
 ) -> Result<IdleAction> {
     let mut next_battery_refresh_us = esp_timer_us().saturating_add(BATTERY_REFRESH_US);
     loop {
@@ -790,6 +844,11 @@ fn wait_for_idle_action(
                 ButtonBAction::ToggleTransport => IdleAction::ToggleTransport,
                 ButtonBAction::Setup => IdleAction::Setup,
             });
+        }
+        if let Some(transport) = poll_transport_control(control_socket)? {
+            if transport != TransportMode::Wireless {
+                return Ok(IdleAction::SetTransport(transport));
+            }
         }
 
         let now_us = esp_timer_us();
@@ -807,6 +866,7 @@ fn wait_for_usb_action(
     display: &mut display::StickDisplay<'_>,
     pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
     audio: &usb_audio::UsbAudio,
+    control_socket: &UdpSocket,
 ) -> Result<IdleAction> {
     let mut next_battery_refresh_us = esp_timer_us().saturating_add(BATTERY_REFRESH_US);
     let mut next_level_refresh_us = esp_timer_us().saturating_add(LEVEL_REFRESH_US);
@@ -818,6 +878,11 @@ fn wait_for_usb_action(
                 ButtonBAction::ToggleTransport => IdleAction::ToggleTransport,
                 ButtonBAction::Setup => IdleAction::Setup,
             });
+        }
+        if let Some(transport) = poll_transport_control(control_socket)? {
+            if transport != TransportMode::Usb {
+                return Ok(IdleAction::SetTransport(transport));
+            }
         }
 
         let now_us = esp_timer_us();

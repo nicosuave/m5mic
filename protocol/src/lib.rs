@@ -1,6 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 pub const DISCOVERY_PORT: u16 = 47_777;
+pub const CONTROL_PORT: u16 = 47_779;
 pub const WS_PORT: u16 = 47_776;
 pub const WS_PATH: &str = "/audio";
 pub const MDNS_SERVICE: &str = "_m5mic";
@@ -8,6 +9,8 @@ pub const MDNS_PROTO: &str = "_tcp";
 pub const MDNS_TYPE_DOMAIN: &str = "_m5mic._tcp.local.";
 pub const DISCOVERY_REQUEST: &[u8] = b"M5MIC_DISCOVER_V1";
 pub const DISCOVERY_RESPONSE_PREFIX: &str = "M5MIC_SERVER_V1 ";
+pub const CONTROL_MODE_USB: &[u8] = b"M5MIC_MODE_USB_V1";
+pub const CONTROL_MODE_WIRELESS: &[u8] = b"M5MIC_MODE_WIRELESS_V1";
 
 pub const MAGIC: [u8; 4] = *b"M5AU";
 pub const VERSION: u8 = 1;

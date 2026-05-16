@@ -1,17 +1,19 @@
 # m5mic
 
-Rust firmware and a Rust desktop receiver for using an M5StickS3 as a live microphone.
+Rust firmware and a macOS menu-bar receiver for using an M5StickS3 as a live microphone.
 
 The firmware has two transports and the Mac side has two receive modes:
 
 1. USB Audio Class microphone. On macOS, it lists as `m5mic` from manufacturer `M5Stack`, 1 channel at 16 kHz.
 2. Raw `pcm_s16le` over WebSocket to the Rust receiver.
-3. Wireless virtual microphone on macOS. The Rust status-bar app hosts the receiver and feeds a Rust CoreAudio driver named `m5mic`.
+3. Wireless virtual microphone on macOS. The Rust menu-bar app hosts the receiver and feeds a Rust CoreAudio driver named `m5mic`.
 
 Wireless discovery is handled two ways:
 
 1. The receiver advertises `_m5mic._tcp.local` via mDNS.
 2. The firmware falls back to UDP broadcast on port `47777`.
+
+The menu-bar app can switch between wireless and USB mode. It sets the macOS default input and sends a UDP mode command to the StickS3 on port `47779`; the USB menu item only appears while macOS sees the USB `m5mic` input.
 
 ## Photos
 
@@ -20,7 +22,70 @@ Wireless discovery is handled two ways:
   <img src="docs/images/m5mic-0945.jpg" alt="M5StickS3 recording screen" width="320">
 </p>
 
-## Receiver
+## macOS Menu Bar App
+
+The normal Mac workflow is the menu-bar app plus the CoreAudio driver. The app shows a red outline dot while idle, a filled red dot while recording, receiver status, USB connection status, and mode-switch actions.
+
+<p>
+  <img src="docs/images/m5mic-menubar.png" alt="m5mic menu-bar app dropdown" width="420">
+</p>
+
+Install the CoreAudio driver. macOS loads HAL plug-ins from the system audio plug-in directory, so this uses `sudo`:
+
+```sh
+scripts/install-coreaudio-driver.sh
+```
+
+Build and open the app:
+
+```sh
+scripts/build-statusbar-app.sh
+open target/m5mic.app
+```
+
+After install, macOS apps can select `m5mic` as an input device. Use the menu to:
+
+- switch to wireless mode and select the virtual `m5mic` input
+- switch to USB mode and select the USB `m5mic` input, when plugged in
+- open Sound Settings
+- quit the receiver
+
+Uninstall the driver:
+
+```sh
+scripts/uninstall-coreaudio-driver.sh
+```
+
+## Local Release
+
+`scripts/release-local.sh` builds a signed release zip containing `m5mic.app`, `m5mic.driver`, and install/uninstall scripts. It uses a local Developer ID Application certificate and optionally notarizes through a local `notarytool` Keychain profile. No Apple credentials need to go into GitHub.
+
+One-time notarization setup:
+
+```sh
+xcrun notarytool store-credentials "m5mic-notary" \
+  --apple-id "<apple-id>" \
+  --team-id "<team-id>" \
+  --password "<app-specific-password>"
+```
+
+Then create `.env.release.local`, which is ignored by git:
+
+```sh
+M5MIC_NOTARY_PROFILE='m5mic-notary'
+```
+
+The profile name can be any local `notarytool` Keychain profile that belongs to the signing team.
+
+Build the release:
+
+```sh
+scripts/release-local.sh
+```
+
+If `M5MIC_NOTARY_PROFILE` is unset, the script still creates a Developer ID signed archive, but it skips notarization.
+
+## Receiver CLI
 
 Foreground development:
 
@@ -56,37 +121,6 @@ In wireless mode, tap BtnA once to start a locked recording and tap BtnA again t
 Short-tap BtnB to toggle between wireless mode and USB mic mode. Hold BtnB during boot, or hold BtnB for about two seconds while idle, to start the captive setup portal.
 
 Wi-Fi setup is optional. Join the `M5Mic-XXXX` access point and open `http://192.168.71.1` if the captive page does not appear automatically. Saved Wi-Fi credentials are stored in NVS and take priority over the build-time `WIFI_SSID` / `WIFI_PASS` fallback.
-
-## Wireless Virtual Mic
-
-Install the CoreAudio driver. macOS loads HAL plug-ins from the system audio plug-in directory, so this uses `sudo`:
-
-```sh
-scripts/install-coreaudio-driver.sh
-```
-
-Run the status-bar receiver:
-
-```sh
-cargo run -p m5mic-statusbar
-```
-
-Or build a menu-bar `.app` bundle:
-
-```sh
-scripts/build-statusbar-app.sh
-open target/m5mic.app
-```
-
-The status-bar app owns mDNS, UDP discovery, WebSocket receive, and reconnect behavior. It feeds a shared 48 kHz mono float ring buffer. The CoreAudio driver only reads that ring and returns silence when the app is not receiving audio.
-
-After install, macOS apps can select `m5mic` as an input device. Use the status-bar menu to open Sound Settings or quit the receiver.
-
-Uninstall the driver:
-
-```sh
-scripts/uninstall-coreaudio-driver.sh
-```
 
 ## UI Preview
 
