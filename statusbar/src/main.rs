@@ -2,13 +2,13 @@ use std::{
     ffi::CStr,
     mem::size_of,
     net::{Ipv4Addr, SocketAddrV4, UdpSocket},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     ptr, thread,
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use coreaudio_sys::*;
 use m5mic_protocol::{
@@ -22,8 +22,10 @@ use tray_icon::{
 };
 use winit::{
     event::Event,
-    event_loop::{ControlFlow, EventLoop},
+    event_loop::{ControlFlow, EventLoop, EventLoopProxy},
 };
+
+const INSTALLED_DRIVER_PATH: &str = "/Library/Audio/Plug-Ins/HAL/m5mic.driver";
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -48,6 +50,8 @@ enum UserEvent {
     Menu(MenuEvent),
     Status(ReceiverStatus),
     Usb(UsbStatus),
+    Driver(DriverStatus),
+    DriverInstall(DriverInstallResult),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +59,20 @@ enum UsbStatus {
     Connected,
     Disconnected,
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DriverStatus {
+    Installed,
+    Missing,
+    Unavailable,
+}
+
+#[derive(Debug)]
+enum DriverInstallResult {
+    Installed,
+    Skipped,
+    Failed(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,8 +158,27 @@ fn main() -> Result<()> {
         }
     });
 
+    runtime.spawn({
+        let proxy = proxy.clone();
+        async move {
+            let mut last_status = None;
+            loop {
+                let status = driver_status();
+                if last_status != Some(status) {
+                    last_status = Some(status);
+                    let _ = proxy.send_event(UserEvent::Driver(status));
+                }
+                time::sleep(Duration::from_secs(10)).await;
+            }
+        }
+    });
+
     let initial_usb_status = usb_status();
+    let initial_driver_status = driver_status();
     let status_item = MenuItem::new("Status: starting", false, None);
+    let driver_status_item = MenuItem::new("Driver: checking", false, None);
+    let install_driver_item =
+        MenuItem::with_id("install-driver", "Install Audio Driver...", true, None);
     let usb_status_item = MenuItem::new("USB: checking", false, None);
     let wireless_mode_item = MenuItem::with_id("mode-wireless", "Use Wireless Mode", true, None);
     let usb_mode_item = MenuItem::with_id("mode-usb", "Use USB Mode", true, None);
@@ -150,6 +187,10 @@ fn main() -> Result<()> {
     let separator = PredefinedMenuItem::separator();
     let menu = Menu::new();
     menu.append(&status_item).context("add status menu item")?;
+    menu.append(&driver_status_item)
+        .context("add driver status menu item")?;
+    menu.append(&install_driver_item)
+        .context("add driver install menu item")?;
     menu.append(&usb_status_item)
         .context("add USB status menu item")?;
     menu.append(&wireless_mode_item)
@@ -165,6 +206,15 @@ fn main() -> Result<()> {
         .context("add sound settings menu item")?;
     menu.append(&quit_item).context("add quit menu item")?;
     let menu_handle = menu.clone();
+    let mut current_driver_status = initial_driver_status;
+    let mut driver_install_running = false;
+    let mut driver_install_prompted = false;
+    sync_driver_menu(
+        &driver_status_item,
+        &install_driver_item,
+        current_driver_status,
+        driver_install_running,
+    );
 
     let tray = TrayIconBuilder::new()
         .with_tooltip("m5mic")
@@ -172,6 +222,20 @@ fn main() -> Result<()> {
         .with_menu(Box::new(menu))
         .build()
         .context("create tray icon")?;
+
+    let event_proxy = proxy.clone();
+    if matches!(current_driver_status, DriverStatus::Missing) {
+        driver_install_running = true;
+        driver_install_prompted = true;
+        status_item.set_text("Status: audio driver required");
+        sync_driver_menu(
+            &driver_status_item,
+            &install_driver_item,
+            current_driver_status,
+            driver_install_running,
+        );
+        spawn_driver_install_prompt(event_proxy.clone());
+    }
 
     #[allow(deprecated)]
     let run_result = event_loop.run(move |event, event_loop| match event {
@@ -187,6 +251,49 @@ fn main() -> Result<()> {
             usb_status_item.set_text(format!("USB: {}", usb_status_text(status)));
             sync_usb_mode_item(&menu_handle, &usb_mode_item, status, &mut usb_mode_visible);
         }
+        Event::UserEvent(UserEvent::Driver(status)) => {
+            current_driver_status = status;
+            sync_driver_menu(
+                &driver_status_item,
+                &install_driver_item,
+                current_driver_status,
+                driver_install_running,
+            );
+            if !driver_install_prompted && matches!(current_driver_status, DriverStatus::Missing) {
+                driver_install_running = true;
+                driver_install_prompted = true;
+                status_item.set_text("Status: audio driver required");
+                sync_driver_menu(
+                    &driver_status_item,
+                    &install_driver_item,
+                    current_driver_status,
+                    driver_install_running,
+                );
+                spawn_driver_install_prompt(event_proxy.clone());
+            }
+        }
+        Event::UserEvent(UserEvent::DriverInstall(result)) => {
+            driver_install_running = false;
+            current_driver_status = driver_status();
+            match result {
+                DriverInstallResult::Installed => {
+                    status_item.set_text("Status: audio driver installed");
+                }
+                DriverInstallResult::Skipped => {
+                    status_item.set_text("Status: audio driver not installed");
+                }
+                DriverInstallResult::Failed(err) => {
+                    tracing::warn!(?err, "failed to install audio driver");
+                    status_item.set_text("Status: audio driver install failed");
+                }
+            }
+            sync_driver_menu(
+                &driver_status_item,
+                &install_driver_item,
+                current_driver_status,
+                driver_install_running,
+            );
+        }
         Event::UserEvent(UserEvent::Menu(event)) => {
             if event.id == MenuId::from("sound-settings") {
                 open_sound_settings();
@@ -196,6 +303,16 @@ fn main() -> Result<()> {
                 set_menu_input_mode(InputMode::Wireless, &status_item);
             } else if event.id == MenuId::from("mode-usb") {
                 set_menu_input_mode(InputMode::Usb, &status_item);
+            } else if event.id == MenuId::from("install-driver") && !driver_install_running {
+                driver_install_running = true;
+                status_item.set_text("Status: installing audio driver");
+                sync_driver_menu(
+                    &driver_status_item,
+                    &install_driver_item,
+                    current_driver_status,
+                    driver_install_running,
+                );
+                spawn_driver_install_prompt(event_proxy.clone());
             }
         }
         _ => {}
@@ -295,6 +412,122 @@ fn usb_status_text(status: UsbStatus) -> &'static str {
     }
 }
 
+fn driver_status() -> DriverStatus {
+    if installed_driver_path().exists() {
+        DriverStatus::Installed
+    } else if bundled_driver_path().is_some() {
+        DriverStatus::Missing
+    } else {
+        DriverStatus::Unavailable
+    }
+}
+
+fn installed_driver_path() -> PathBuf {
+    PathBuf::from(INSTALLED_DRIVER_PATH)
+}
+
+fn bundled_driver_path() -> Option<PathBuf> {
+    let exe_path = std::env::current_exe().ok()?;
+    let macos_dir = exe_path.parent()?;
+    let contents_dir = macos_dir.parent()?;
+    let app_driver = contents_dir.join("Resources").join("m5mic.driver");
+    if app_driver.exists() {
+        return Some(app_driver);
+    }
+
+    let dev_driver = contents_dir.join("m5mic.driver");
+    dev_driver.exists().then_some(dev_driver)
+}
+
+fn sync_driver_menu(
+    driver_status_item: &MenuItem,
+    install_driver_item: &MenuItem,
+    status: DriverStatus,
+    install_running: bool,
+) {
+    if install_running {
+        driver_status_item.set_text("Driver: installing");
+        install_driver_item.set_text("Installing Audio Driver...");
+        install_driver_item.set_enabled(false);
+        return;
+    }
+
+    match status {
+        DriverStatus::Installed => {
+            driver_status_item.set_text("Driver: installed");
+            install_driver_item.set_text("Audio Driver Installed");
+            install_driver_item.set_enabled(false);
+        }
+        DriverStatus::Missing => {
+            driver_status_item.set_text("Driver: install required");
+            install_driver_item.set_text("Install Audio Driver...");
+            install_driver_item.set_enabled(true);
+        }
+        DriverStatus::Unavailable => {
+            driver_status_item.set_text("Driver: bundled copy missing");
+            install_driver_item.set_text("Audio Driver Unavailable");
+            install_driver_item.set_enabled(false);
+        }
+    }
+}
+
+fn spawn_driver_install_prompt(proxy: EventLoopProxy<UserEvent>) {
+    thread::spawn(move || {
+        let result = match run_driver_install_prompt() {
+            Ok(true) => DriverInstallResult::Installed,
+            Ok(false) => DriverInstallResult::Skipped,
+            Err(err) => DriverInstallResult::Failed(err.to_string()),
+        };
+        let _ = proxy.send_event(UserEvent::DriverInstall(result));
+        let _ = proxy.send_event(UserEvent::Driver(driver_status()));
+    });
+}
+
+fn run_driver_install_prompt() -> Result<bool> {
+    let source = bundled_driver_path().context("bundled m5mic.driver was not found")?;
+    let destination = installed_driver_path();
+    let driver_dir = destination
+        .parent()
+        .ok_or_else(|| anyhow!("invalid driver install path"))?;
+    let install_command = format!(
+        "/bin/mkdir -p {driver_dir} && /bin/rm -rf {destination} && /bin/cp -R {source} {destination} && /usr/sbin/chown -R root:wheel {destination} && (/usr/bin/killall coreaudiod >/dev/null 2>&1 || true)",
+        driver_dir = shell_quote(driver_dir),
+        destination = shell_quote(&destination),
+        source = shell_quote(&source),
+    );
+    let script = format!(
+        "set buttonChoice to button returned of (display dialog {message} with title {title} buttons {{\"Later\", \"Install\"}} default button \"Install\")\nif buttonChoice is \"Install\" then\n    do shell script {command} with administrator privileges\nend if",
+        message = applescript_string("m5mic needs to install its CoreAudio driver before the virtual microphone can appear in Sound Settings."),
+        title = applescript_string("m5mic"),
+        command = applescript_string(&install_command),
+    );
+
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .context("run driver install prompt")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = stderr.trim();
+        if message.is_empty() {
+            anyhow::bail!("osascript exited with {}", output.status);
+        }
+        anyhow::bail!("{message}");
+    }
+
+    Ok(installed_driver_path().exists())
+}
+
+fn shell_quote(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn applescript_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 fn sync_usb_mode_item(
     menu: &Menu,
     usb_mode_item: &MenuItem,
@@ -307,7 +540,7 @@ fn sync_usb_mode_item(
     }
 
     let result = if should_show {
-        menu.insert(usb_mode_item, 3)
+        menu.insert(usb_mode_item, 5)
     } else {
         menu.remove(usb_mode_item)
     };

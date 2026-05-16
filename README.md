@@ -1,19 +1,18 @@
 # m5mic
 
-Rust firmware and a macOS menu-bar receiver for using an M5StickS3 as a live microphone.
+Rust firmware and a macOS menu-bar app for using an M5StickS3 as either a standalone USB microphone or a wireless microphone.
 
-The firmware has two transports and the Mac side has two receive modes:
+The firmware supports two microphone paths:
 
-1. USB Audio Class microphone. On macOS, it lists as `m5mic` from manufacturer `M5Stack`, 1 channel at 16 kHz.
-2. Raw `pcm_s16le` over WebSocket to the Rust receiver.
-3. Wireless virtual microphone on macOS. The Rust menu-bar app hosts the receiver and feeds a Rust CoreAudio driver named `m5mic`.
+1. USB Audio Class microphone. Plug it in and select `m5mic` in your OS or app. No Wi-Fi, receiver, menu-bar app, or driver install is required.
+2. Wireless `pcm_s16le` over WebSocket. The Rust receiver can record this stream to WAV files. On macOS only, the m5mic menu-bar app can also expose the wireless stream as a system input device through a Rust CoreAudio driver named `m5mic`.
 
 Wireless discovery is handled two ways:
 
 1. The receiver advertises `_m5mic._tcp.local` via mDNS.
 2. The firmware falls back to UDP broadcast on port `47777`.
 
-The menu-bar app can switch between wireless and USB mode. It sets the macOS default input and sends a UDP mode command to the StickS3 on port `47779`; the USB menu item only appears while macOS sees the USB `m5mic` input.
+The macOS menu-bar app is only required for wireless virtual microphone mode. It can also switch between wireless and USB mode, set the macOS default input, and send a UDP mode command to the StickS3 on port `47779`; the USB menu item only appears while macOS sees the USB `m5mic` input.
 
 ## Photos
 
@@ -24,36 +23,30 @@ The menu-bar app can switch between wireless and USB mode. It sets the macOS def
 
 ## macOS Menu Bar App
 
-The normal Mac workflow is the menu-bar app plus the CoreAudio driver. The app shows a red outline dot while idle, a filled red dot while recording, receiver status, USB connection status, and mode-switch actions.
+USB mic mode does not require the Mac app: plug in the StickS3 and select `m5mic` as the input. The menu-bar app is for wireless virtual mic mode on macOS, plus optional status and mode switching. It shows a red outline dot while idle, a filled red dot while recording, receiver status, driver status, USB connection status, and mode-switch actions.
 
 <p>
   <img src="docs/images/m5mic-menubar.png" alt="m5mic menu-bar app dropdown" width="420">
 </p>
 
-Install the CoreAudio driver. macOS loads HAL plug-ins from the system audio plug-in directory, so this uses `sudo`:
+Download the latest notarized macOS release from [GitHub Releases](https://github.com/nicosuave/m5mic/releases/latest). Unzip it, drag `m5mic.app` to `/Applications`, then open it. If the CoreAudio virtual microphone driver is not installed yet, the app prompts to install it with the standard macOS administrator dialog.
 
-Download the latest notarized macOS release from [GitHub Releases](https://github.com/nicosuave/m5mic/releases/latest). Unzip it, drag `m5mic.app` to `/Applications`, then install the virtual mic driver:
-
-```sh
-./install-driver.sh
-```
-
-Open `/Applications/m5mic.app` after the driver is installed.
+The release also includes `install-driver.sh` for manual repair if the in-app install is skipped or interrupted.
 
 To build from source instead:
-
-```sh
-scripts/install-coreaudio-driver.sh
-```
-
-Then build and open the app:
 
 ```sh
 scripts/build-statusbar-app.sh
 open target/m5mic.app
 ```
 
-After install, macOS apps can select `m5mic` as an input device. Use the menu to:
+For source builds, the app bundles `target/m5mic.driver` and uses the same in-app installer. You can still install or repair the driver manually:
+
+```sh
+scripts/install-coreaudio-driver.sh
+```
+
+After install, macOS apps can select wireless `m5mic` as an input device. Use the menu to:
 
 - switch to wireless mode and select the virtual `m5mic` input
 - switch to USB mode and select the USB `m5mic` input, when plugged in
@@ -68,7 +61,7 @@ scripts/uninstall-coreaudio-driver.sh
 
 ## Maintainer Release
 
-`scripts/release-local.sh` builds a signed release zip containing `m5mic.app`, `m5mic.driver`, and install/uninstall scripts. It uses a local Developer ID Application certificate and optionally notarizes through a local `notarytool` Keychain profile. No Apple credentials need to go into GitHub.
+`scripts/release-local.sh` builds a signed release zip containing `m5mic.app` with the driver bundled inside it, plus `m5mic.driver` and install/uninstall scripts for manual repair. It uses a local Developer ID Application certificate and optionally notarizes through a local `notarytool` Keychain profile. No Apple credentials need to go into GitHub.
 
 One-time notarization setup:
 

@@ -100,9 +100,12 @@ m5mic ${version}
 
 Install:
 1. Drag m5mic.app to /Applications.
-2. Run ./install-driver.sh to install the CoreAudio virtual microphone driver.
-3. Open m5mic.app from /Applications.
+2. Open m5mic.app from /Applications.
+3. Click Install when m5mic asks to install the CoreAudio virtual microphone driver.
 4. Select "m5mic" as your microphone, or use the menu-bar app to switch wireless/USB mode.
+
+Manual driver repair:
+Run ./install-driver.sh if the in-app installer is skipped or interrupted.
 
 Uninstall:
 1. Quit m5mic from the menu bar.
