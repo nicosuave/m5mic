@@ -5,7 +5,7 @@ Rust firmware and a macOS menu-bar app for using an M5StickS3 as either a standa
 The firmware supports two microphone paths:
 
 1. USB Audio Class microphone. Plug it in and select `m5mic` in your OS or app. No Wi-Fi, receiver, menu-bar app, or driver install is required.
-2. Wireless `pcm_s16le` over WebSocket. The Rust receiver can record this stream to WAV files. On macOS only, the m5mic menu-bar app can also expose the wireless stream as a system input device through a Rust CoreAudio driver named `m5mic`.
+2. Wireless `pcm_s16le` over WebSocket. On macOS, the m5mic menu-bar app exposes this live stream as a system input device through a Rust CoreAudio driver named `m5mic`. The standalone receiver CLI can optionally save raw WAV captures for debugging.
 
 Wireless discovery is handled two ways:
 
@@ -23,7 +23,9 @@ The macOS menu-bar app is only required for wireless virtual microphone mode. It
 
 ## macOS Menu Bar App
 
-USB mic mode does not require the Mac app: plug in the StickS3 and select `m5mic` as the input. The menu-bar app is for wireless virtual mic mode on macOS, plus optional status and mode switching. It shows a red outline dot while idle, a filled red dot while recording, receiver status, driver status, USB connection status, and mode-switch actions.
+USB mic mode does not require the Mac app: plug in the StickS3 and select `m5mic` as the input. The menu-bar app is for wireless virtual mic mode on macOS, plus optional status and mode switching. It shows a red outline dot while idle, a filled red dot while the StickS3 is streaming audio, receiver status, driver status, USB connection status, and mode-switch actions.
+
+The menu-bar app does not save recordings by default. It receives live audio and feeds the virtual microphone only.
 
 <p>
   <img src="docs/images/m5mic-menubar.png" alt="m5mic menu-bar app dropdown" width="420">
@@ -90,14 +92,16 @@ If `M5MIC_NOTARY_PROFILE` is unset, the script still creates a Developer ID sign
 
 ## Receiver CLI
 
-Foreground development:
+The standalone receiver CLI is mainly for development and debugging. Unlike the menu-bar app, it saves each incoming stream as an uncompressed WAV file by default.
+
+Foreground WAV capture:
 
 ```sh
 mkdir -p captures
 cargo run -p m5mic-receiver -- --output-dir captures
 ```
 
-It listens on `0.0.0.0:47776`, accepts WebSocket connections at `/audio`, and writes each stream to a WAV file.
+It listens on `0.0.0.0:47776`, accepts WebSocket connections at `/audio`, and writes each stream to `captures/` as a raw WAV file.
 
 Virtual mic mode without WAV files:
 
@@ -119,7 +123,7 @@ tmux kill-session -t m5mic-receiver
 lsof -nP -iTCP:47776
 ```
 
-In wireless mode, tap BtnA once to start a locked recording and tap BtnA again to stop. Hold BtnA for push-to-talk; release it to stop. Each start/stop cycle creates a separate WAV file on the receiver.
+In wireless mode, tap BtnA once to start a latched live stream and tap BtnA again to stop. Hold BtnA for push-to-talk; release it to stop. The menu-bar app uses that audio live only; the standalone receiver CLI creates WAV files only when recordings are enabled.
 
 Short-tap BtnB to toggle between wireless mode and USB mic mode. Hold BtnB during boot, or hold BtnB for about two seconds while idle, to start the captive setup portal.
 
