@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>M5StickS3 Mic UI Preview</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #060911;
+        --panel: #0b111d;
+        --panel-2: #141d2f;
+        --text: #eef2ff;
+        --muted: #8796ad;
+        --red: #ef2e46;
+        --line: #24324e;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--bg);
+        color: var(--text);
+        font: 15px/1.4 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      main {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 18px;
+      }
+
+      header {
+        display: flex;
+        justify-content: space-between;
+        gap: 24px;
+        margin-bottom: 22px;
+      }
+
+      h1 {
+        margin: 0 0 5px;
+        font-size: 24px;
+        line-height: 1.1;
+      }
+
+      p {
+        margin: 0;
+        color: var(--muted);
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+        gap: 12px;
+      }
+
+      .shot {
+        display: grid;
+        gap: 8px;
+        justify-items: center;
+        padding: 10px;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.035);
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.075);
+      }
+
+      .shot strong {
+        font-size: 13px;
+      }
+
+      canvas {
+        width: 135px;
+        height: 240px;
+        image-rendering: pixelated;
+        border-radius: 10px;
+        background: #03060e;
+        box-shadow:
+          0 24px 60px rgba(0, 0, 0, 0.42),
+          0 0 0 1px rgba(255, 255, 255, 0.14);
+      }
+
+      @media (min-width: 900px) {
+        canvas {
+          width: 202.5px;
+          height: 360px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>Direction C, fixed</h1>
+          <p>Red dot only. Large bitmap text. No icon. No overlapping vertical zones.</p>
+        </div>
+        <p>135 x 240 logical pixels</p>
+      </header>
+      <div class="grid" id="grid"></div>
+    </main>
+
+    <script>
+      const W = 135;
+      const H = 240;
+      const c = {
+        bg: "#03060e",
+        panel: "#0b111d",
+        panel2: "#121b2d",
+        panel3: "#1c273e",
+        text: "#eef2ff",
+        muted: "#8796ad",
+        line: "#24324e",
+        green: "#2cd67d",
+        cyan: "#40c4ff",
+        amber: "#fcb045",
+        red: "#ef2e46",
+        redSoft: "#961b31",
+        redDark: "#420d1b",
+      };
+
+      const glyphs = {
+        " ": [0, 0, 0, 0, 0],
+        "!": [0, 0, 0x5f, 0, 0],
+        ".": [0, 0x60, 0x60, 0, 0],
+        ":": [0, 0x36, 0x36, 0, 0],
+        "%": [0x23, 0x13, 0x08, 0x64, 0x62],
+        "-": [0x08, 0x08, 0x08, 0x08, 0x08],
+        "0": [0x3e, 0x51, 0x49, 0x45, 0x3e],
+        "1": [0, 0x42, 0x7f, 0x40, 0],
+        "2": [0x42, 0x61, 0x51, 0x49, 0x46],
+        "3": [0x21, 0x41, 0x45, 0x4b, 0x31],
+        "4": [0x18, 0x14, 0x12, 0x7f, 0x10],
+        "5": [0x27, 0x45, 0x45, 0x45, 0x39],
+        "6": [0x3c, 0x4a, 0x49, 0x49, 0x30],
+        "7": [0x01, 0x71, 0x09, 0x05, 0x03],
+        "8": [0x36, 0x49, 0x49, 0x49, 0x36],
+        "9": [0x06, 0x49, 0x49, 0x29, 0x1e],
+        A: [0x7e, 0x11, 0x11, 0x11, 0x7e],
+        B: [0x7f, 0x49, 0x49, 0x49, 0x36],
+        C: [0x3e, 0x41, 0x41, 0x41, 0x22],
+        D: [0x7f, 0x41, 0x41, 0x22, 0x1c],
+        E: [0x7f, 0x49, 0x49, 0x49, 0x41],
+        F: [0x7f, 0x09, 0x09, 0x09, 0x01],
+        G: [0x3e, 0x41, 0x49, 0x49, 0x7a],
+        H: [0x7f, 0x08, 0x08, 0x08, 0x7f],
+        I: [0, 0x41, 0x7f, 0x41, 0],
+        J: [0x20, 0x40, 0x41, 0x3f, 0x01],
+        K: [0x7f, 0x08, 0x14, 0x22, 0x41],
+        L: [0x7f, 0x40, 0x40, 0x40, 0x40],
+        M: [0x7f, 0x02, 0x0c, 0x02, 0x7f],
+        N: [0x7f, 0x04, 0x08, 0x10, 0x7f],
+        O: [0x3e, 0x41, 0x41, 0x41, 0x3e],
+        P: [0x7f, 0x09, 0x09, 0x09, 0x06],
+        Q: [0x3e, 0x41, 0x51, 0x21, 0x5e],
+        R: [0x7f, 0x09, 0x19, 0x29, 0x46],
+        S: [0x46, 0x49, 0x49, 0x49, 0x31],
+        T: [0x01, 0x01, 0x7f, 0x01, 0x01],
+        U: [0x3f, 0x40, 0x40, 0x40, 0x3f],
+        V: [0x1f, 0x20, 0x40, 0x20, 0x1f],
+        W: [0x3f, 0x40, 0x38, 0x40, 0x3f],
+        X: [0x63, 0x14, 0x08, 0x14, 0x63],
+        Y: [0x07, 0x08, 0x70, 0x08, 0x07],
+        Z: [0x61, 0x51, 0x49, 0x45, 0x43],
+      };
+
+      class S {
+        constructor(ctx) {
+          this.ctx = ctx;
+          ctx.imageSmoothingEnabled = false;
+        }
+
+        rect(x, y, w, h, color) {
+          this.ctx.fillStyle = color;
+          this.ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
+        }
+
+        circle(x, y, r, color) {
+          this.ctx.fillStyle = color;
+          this.ctx.beginPath();
+          this.ctx.arc(x, y, r, 0, Math.PI * 2);
+          this.ctx.fill();
+        }
+
+        ring(x, y, outer, inner, color, fill = c.bg) {
+          this.circle(x, y, outer, color);
+          this.circle(x, y, inner, fill);
+        }
+
+        textWidth(text, scale) {
+          return text.length * 6 * scale - scale;
+        }
+
+        text(text, x, y, scale, color) {
+          this.ctx.fillStyle = color;
+          let cursor = x;
+          for (const raw of text.toUpperCase()) {
+            const glyph = glyphs[raw] || glyphs[" "];
+            for (let col = 0; col < 5; col += 1) {
+              for (let row = 0; row < 7; row += 1) {
+                if ((glyph[col] & (1 << row)) !== 0) {
+                  this.ctx.fillRect(cursor + col * scale, y + row * scale, scale, scale);
+                }
+              }
+            }
+            cursor += 6 * scale;
+          }
+        }
+
+        centered(text, y, scale, color) {
+          this.text(text, Math.floor((W - this.textWidth(text, scale)) / 2), y, scale, color);
+        }
+
+        base(recording = false, netColor = c.green) {
+          this.rect(0, 0, W, H, c.bg);
+          this.rect(0, 0, W, 31, c.panel);
+          this.rect(0, 31, W, 1, c.line);
+          if (recording) this.rect(0, 32, W, 3, c.redDark);
+          this.text("MIC", 8, 8, 2, c.text);
+          this.rect(56, 18, 3, 4, netColor);
+          this.rect(62, 14, 3, 8, netColor);
+          this.rect(68, 10, 3, 12, netColor);
+          this.text("82%", 91, 8, 2, c.green);
+        }
+
+        dot(x, y, size = 48, active = false) {
+          this.ring(x, y, size, size - 8, active ? c.red : c.redDark);
+          this.ring(x, y, size - 15, size - 22, active ? c.redSoft : c.red);
+          this.circle(x, y, size - 27, c.red);
+        }
+
+        progress(y, color, phase = 0) {
+          this.rect(18, y, 99, 5, c.panel3);
+          this.rect(18 + phase, y, 36, 5, color);
+        }
+
+        divider(y, color = c.line) {
+          this.rect(18, y, 99, 1, color);
+        }
+
+        level(y, active = 8) {
+          this.text("LEVEL", 12, y, 1, c.muted);
+          for (let i = 0; i < 12; i += 1) {
+            const h = 6 + i * 2;
+            const color = i < active ? (i > 9 ? c.red : i > 7 ? c.amber : c.green) : c.panel3;
+            this.rect(13 + i * 9, y + 34 - h, 6, h, color);
+          }
+        }
+
+        buffer(y) {
+          this.text("BUF", 12, y, 1, c.muted);
+          this.rect(43, y + 3, 72, 5, c.panel3);
+          this.rect(43, y + 3, 24, 5, c.cyan);
+        }
+      }
+
+      const shots = [];
+
+      function shot(label, draw) {
+        const wrap = document.createElement("div");
+        wrap.className = "shot";
+        const title = document.createElement("strong");
+        title.textContent = label;
+        const canvas = document.createElement("canvas");
+        canvas.width = W;
+        canvas.height = H;
+        wrap.append(title, canvas);
+        document.querySelector("#grid").append(wrap);
+        shots.push({ canvas, draw });
+      }
+
+      function render(now = 0) {
+        for (const item of shots) {
+          item.draw(new S(item.canvas.getContext("2d")), now);
+        }
+        requestAnimationFrame(render);
+      }
+
+      shot("Home", (s) => {
+        s.base(false);
+        s.dot(67, 82, 48, false);
+        s.centered("TAP", 139, 3, c.text);
+        s.centered("START", 168, 2, c.red);
+        s.centered("HOLD A TALK", 219, 1, c.muted);
+      });
+
+      shot("Recording", (s) => {
+        s.base(true);
+        s.dot(67, 78, 43, true);
+        s.centered("00:12", 123, 4, c.text);
+        s.level(164, 9);
+        s.buffer(207);
+        s.centered("STOP", 223, 2, c.muted);
+      });
+
+      shot("Push-to-talk", (s) => {
+        s.base(true);
+        s.dot(67, 78, 43, true);
+        s.centered("00:12", 123, 4, c.text);
+        s.level(164, 7);
+        s.buffer(207);
+        s.centered("RELEASE", 223, 2, c.muted);
+      });
+
+      shot("Finding receiver", (s, now) => {
+        s.base(false);
+        s.centered("FINDING", 56, 2, c.amber);
+        s.centered("RECEIVER", 88, 2, c.text);
+        s.progress(132, c.amber, Math.floor(now / 90) % 64);
+        s.centered("NETWORK", 176, 2, c.muted);
+        s.centered("WAIT", 221, 1, c.muted);
+      });
+
+      shot("Wi-Fi connecting", (s, now) => {
+        s.base(false, c.amber);
+        s.centered("JOINING", 56, 2, c.amber);
+        s.centered("WIFI", 88, 3, c.text);
+        s.progress(132, c.amber, Math.floor(now / 90) % 64);
+        s.centered("PLEASE WAIT", 176, 1, c.muted);
+        s.centered("NO SETUP AP", 221, 1, c.muted);
+      });
+
+      shot("Setup portal", (s) => {
+        s.base(false, c.amber);
+        s.centered("SETUP", 55, 2, c.cyan);
+        s.centered("JOIN WIFI", 91, 2, c.text);
+        s.divider(124, c.cyan);
+        s.centered("M5MIC-4AA4", 151, 1, c.amber);
+        s.centered("192.168.71.1", 221, 1, c.muted);
+      });
+
+      shot("Wi-Fi saved", (s) => {
+        s.base(false, c.green);
+        s.centered("OK", 58, 3, c.green);
+        s.divider(105, c.green);
+        s.centered("WIFI", 139, 2, c.text);
+        s.centered("SAVED", 166, 2, c.text);
+        s.centered("REBOOTING", 221, 1, c.muted);
+      });
+
+      shot("Wi-Fi fail", (s) => {
+        s.base(false, c.amber);
+        s.centered("!", 58, 3, c.red);
+        s.divider(105, c.red);
+        s.centered("WIFI", 139, 2, c.text);
+        s.centered("FAIL", 166, 2, c.text);
+        s.centered("HOLD B SETUP", 221, 1, c.muted);
+      });
+
+      shot("Stream error", (s) => {
+        s.base(false);
+        s.centered("!", 58, 3, c.red);
+        s.divider(105, c.red);
+        s.centered("STREAM", 139, 2, c.text);
+        s.centered("ERROR", 166, 2, c.text);
+        s.centered("PRESS AGAIN", 221, 1, c.muted);
+      });
+
+      requestAnimationFrame(render);
+    </script>
+  </body>
+</html>

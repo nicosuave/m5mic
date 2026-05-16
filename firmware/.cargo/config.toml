@@ -1,0 +1,17 @@
+[build]
+target = "xtensa-esp32s3-espidf"
+target-dir = "target"
+
+[target.xtensa-esp32s3-espidf]
+linker = "ldproxy"
+runner = "espflash flash --monitor"
+rustflags = ["--cfg", "espidf_time64"]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+CARGO_WORKSPACE_DIR = { value = "", relative = true }
+ESP_IDF_TOOLS_INSTALL_DIR = "global"
+ESP_IDF_VERSION = "v5.3.2"
+ESP_IDF_SYS_ROOT_CRATE = "m5mic-firmware"

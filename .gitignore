@@ -1,0 +1,11 @@
+/target/
+/firmware/target/
+/firmware/.embuild/
+/captures/
+/.env
+/.env.*
+/.embuild/
+/.esp-idf/
+sdkconfig
+sdkconfig.old
+managed_components/

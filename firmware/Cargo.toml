@@ -1,0 +1,23 @@
+[package]
+name = "m5mic-firmware"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0"
+embedded-svc = "0.29.0"
+esp-idf-hal = "0.46.2"
+esp-idf-svc = "0.52.1"
+esp-idf-sys = "0.37.2"
+log = "0.4"
+m5mic-protocol = { path = "../protocol", default-features = false }
+
+[build-dependencies]
+embuild = "0.33.1"
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/mdns", version = "1.8.2" }
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp_websocket_client", version = "1.5.0" }
