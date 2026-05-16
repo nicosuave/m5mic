@@ -1,4 +1,4 @@
-# M5StickS3 Microphone Streamer
+# m5mic
 
 Rust firmware and a Rust desktop receiver for using an M5StickS3 as a live Wi-Fi microphone.
 
