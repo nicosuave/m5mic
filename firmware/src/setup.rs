@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as FmtWrite,
     net::UdpSocket,
     str,
     sync::{
@@ -30,42 +31,8 @@ use crate::{
 
 const AP_CHANNEL: u8 = 6;
 const AP_IP: [u8; 4] = [192, 168, 71, 1];
-const MAX_FORM_BYTES: usize = 256;
+const MAX_FORM_BYTES: usize = 512;
 const HTTP_STACK_SIZE: usize = 8192;
-
-const INDEX_HTML: &str = r#"<!doctype html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>M5 Mic Setup</title>
-<style>
-html{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#07101d;color:#edf4ff}
-body{margin:0;min-height:100vh;display:grid;place-items:center}
-main{width:min(390px,calc(100vw - 32px));padding:26px 20px 22px;border:1px solid #263856;background:#0d1728;border-radius:16px}
-h1{font-size:28px;margin:0 0 8px}
-p{color:#9fb0c7;margin:0 0 22px;line-height:1.4}
-label{display:block;font-size:13px;color:#9fb0c7;margin:14px 0 6px}
-input{box-sizing:border-box;width:100%;font:inherit;color:#edf4ff;background:#07101d;border:1px solid #334765;border-radius:10px;padding:13px}
-button{width:100%;margin-top:20px;border:0;border-radius:10px;padding:14px;font:700 16px system-ui;background:#ef2e46;color:white}
-.hint{font-size:12px;margin-top:16px}
-</style>
-</head>
-<body>
-<main>
-<h1>M5 Mic Setup</h1>
-<p>Connect this StickS3 to Wi-Fi. It will reboot back into mic mode after saving.</p>
-<form method="post" action="/save">
-<label>Wi-Fi name</label>
-<input name="ssid" maxlength="32" autocomplete="off" autocapitalize="none" required>
-<label>Password</label>
-<input name="password" maxlength="64" type="password" autocomplete="current-password">
-<button type="submit">Save Wi-Fi</button>
-</form>
-<p class="hint">Open http://192.168.71.1 if the page does not appear automatically.</p>
-</main>
-</body>
-</html>
-"#;
 
 const SAVED_HTML: &str = r#"<!doctype html>
 <html>
@@ -74,6 +41,18 @@ const SAVED_HTML: &str = r#"<!doctype html>
 <main style="width:min(360px,calc(100vw - 32px));text-align:center">
 <h1>Saved</h1>
 <p>The StickS3 is rebooting into mic mode.</p>
+</main>
+</body>
+</html>
+"#;
+
+const REBOOT_HTML: &str = r#"<!doctype html>
+<html>
+<head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Rebooting</title></head>
+<body style="font-family:system-ui;background:#07101d;color:#edf4ff;display:grid;place-items:center;min-height:100vh;margin:0">
+<main style="width:min(360px,calc(100vw - 32px));text-align:center">
+<h1>Rebooting</h1>
+<p>The StickS3 is returning to mic mode.</p>
 </main>
 </body>
 </html>
@@ -119,7 +98,9 @@ pub fn run(
     start_ap(wifi, ssid).context("start setup AP")?;
     spawn_dns_server();
     let saved = Arc::new(AtomicBool::new(false));
-    let _server = start_http_server(store, saved.clone()).context("start setup http server")?;
+    let reboot = Arc::new(AtomicBool::new(false));
+    let _server = start_http_server(store, saved.clone(), reboot.clone())
+        .context("start setup http server")?;
 
     info!("setup portal listening on http://192.168.71.1 with SSID {ssid}");
     loop {
@@ -128,6 +109,13 @@ pub fn run(
                 .show_setup_saved()
                 .context("draw setup saved screen")?;
             FreeRtos::delay_ms(1500);
+            unsafe { esp_idf_sys::esp_restart() };
+        }
+        if reboot.load(Ordering::SeqCst) {
+            display
+                .show_setup_rebooting()
+                .context("draw setup reboot screen")?;
+            FreeRtos::delay_ms(800);
             unsafe { esp_idf_sys::esp_restart() };
         }
         FreeRtos::delay_ms(100);
@@ -161,7 +149,11 @@ fn start_ap(wifi: &mut BlockingWifi<EspWifi<'static>>, ssid: &str) -> Result<()>
     Ok(())
 }
 
-fn start_http_server(store: WifiStore, saved: Arc<AtomicBool>) -> Result<EspHttpServer<'static>> {
+fn start_http_server(
+    store: WifiStore,
+    saved: Arc<AtomicBool>,
+    reboot: Arc<AtomicBool>,
+) -> Result<EspHttpServer<'static>> {
     let mut server = EspHttpServer::new(&HttpServerConfiguration {
         stack_size: HTTP_STACK_SIZE,
         ..Default::default()
@@ -176,13 +168,15 @@ fn start_http_server(store: WifiStore, saved: Arc<AtomicBool>) -> Result<EspHttp
         "/ncsi.txt",
         "/fwlink",
     ] {
-        server.fn_handler::<anyhow::Error, _>(path, Method::Get, |req| {
+        let store = store.clone();
+        server.fn_handler::<anyhow::Error, _>(path, Method::Get, move |req| {
+            let html = settings_html(&store);
             let mut resp = req.into_response(
                 200,
                 Some("OK"),
                 &[("Content-Type", "text/html; charset=utf-8")],
             )?;
-            resp.write_all(INDEX_HTML.as_bytes())?;
+            resp.write_all(html.as_bytes())?;
             Ok(())
         })?;
     }
@@ -198,7 +192,14 @@ fn start_http_server(store: WifiStore, saved: Arc<AtomicBool>) -> Result<EspHttp
         let mut body = [0u8; MAX_FORM_BYTES];
         req.read_exact(&mut body[..len])?;
         let body = str::from_utf8(&body[..len]).context("decode setup form")?;
-        let credentials = parse_credentials(body).context("parse setup form")?;
+        let mut credentials = parse_credentials(body).context("parse setup form")?;
+        if credentials.password.is_empty() {
+            if let Some(existing) = store.load().context("load saved wifi config")? {
+                if existing.ssid == credentials.ssid {
+                    credentials.password = existing.password;
+                }
+            }
+        }
         store.save(&credentials).context("save setup wifi")?;
         saved.store(true, Ordering::SeqCst);
 
@@ -211,7 +212,105 @@ fn start_http_server(store: WifiStore, saved: Arc<AtomicBool>) -> Result<EspHttp
         Ok(())
     })?;
 
+    server.fn_handler::<anyhow::Error, _>("/reboot", Method::Post, move |req| {
+        reboot.store(true, Ordering::SeqCst);
+        let mut resp = req.into_response(
+            200,
+            Some("OK"),
+            &[("Content-Type", "text/html; charset=utf-8")],
+        )?;
+        resp.write_all(REBOOT_HTML.as_bytes())?;
+        Ok(())
+    })?;
+
     Ok(server)
+}
+
+fn settings_html(store: &WifiStore) -> String {
+    let saved = store.load().ok().flatten();
+    let mut html = String::with_capacity(4096);
+    let (status, ssid_value, password_hint) = match saved {
+        Some(credentials) => (
+            format!("Saved network: {}", escape_html(&credentials.ssid)),
+            escape_html(&credentials.ssid),
+            "Leave blank to keep the current password when the Wi-Fi name is unchanged.",
+        ),
+        None => (
+            "No saved Wi-Fi network.".to_string(),
+            String::new(),
+            "Password is optional for open networks.",
+        ),
+    };
+
+    let _ = write!(
+        html,
+        r#"<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>M5 Mic Settings</title>
+<style>
+html{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#07101d;color:#edf4ff}}
+body{{margin:0;min-height:100vh;display:grid;place-items:center}}
+main{{width:min(420px,calc(100vw - 32px));padding:24px 20px 22px;border:1px solid #263856;background:#0d1728;border-radius:16px}}
+h1{{font-size:28px;margin:0 0 8px}}
+h2{{font-size:15px;margin:22px 0 10px;color:#edf4ff}}
+p{{color:#9fb0c7;margin:0;line-height:1.4}}
+.status{{margin:18px 0 0;padding:13px;border:1px solid #263856;border-radius:12px;background:#07101d;color:#edf4ff}}
+.grid{{display:grid;grid-template-columns:1fr auto;gap:8px 12px;margin-top:10px;color:#9fb0c7;font-size:13px}}
+.value{{color:#edf4ff;text-align:right}}
+label{{display:block;font-size:13px;color:#9fb0c7;margin:14px 0 6px}}
+input{{box-sizing:border-box;width:100%;font:inherit;color:#edf4ff;background:#07101d;border:1px solid #334765;border-radius:10px;padding:13px}}
+button{{width:100%;margin-top:20px;border:0;border-radius:10px;padding:14px;font:700 16px system-ui;background:#ef2e46;color:white}}
+button.secondary{{margin-top:10px;background:#20304a;color:#edf4ff}}
+.hint{{font-size:12px;margin-top:16px}}
+</style>
+</head>
+<body>
+<main>
+<h1>M5 Mic Settings</h1>
+<p>Use this page to check device settings or update Wi-Fi. Saving Wi-Fi reboots back into mic mode.</p>
+<div class="status">{status}</div>
+<h2>Power profile</h2>
+<div class="grid">
+<span>Recording on battery</span><span class="value">dim screen, meter paused</span>
+<span>Idle Wi-Fi</span><span class="value">power save</span>
+<span>Idle microphone</span><span class="value">codec off</span>
+</div>
+<h2>Wi-Fi</h2>
+<form method="post" action="/save">
+<label>Wi-Fi name</label>
+<input name="ssid" maxlength="32" autocomplete="off" autocapitalize="none" value="{ssid_value}" required>
+<label>Password</label>
+<input name="password" maxlength="64" type="password" autocomplete="current-password">
+<p class="hint">{password_hint}</p>
+<button type="submit">Save Wi-Fi</button>
+</form>
+<form method="post" action="/reboot">
+<button class="secondary" type="submit">Reboot to Mic Mode</button>
+</form>
+<p class="hint">Open http://192.168.71.1 if the page does not appear automatically.</p>
+</main>
+</body>
+</html>
+"#
+    );
+    html
+}
+
+fn escape_html(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn parse_credentials(body: &str) -> Result<WifiCredentials> {

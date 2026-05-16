@@ -25,7 +25,12 @@ use esp_idf_hal::{
     delay::FreeRtos,
     gpio::{Input, PinDriver, Pull},
     i2s::{I2sDriver, I2sRx},
+    ledc::{
+        config::{Resolution, TimerConfig},
+        LedcDriver, LedcTimerDriver,
+    },
     peripherals::Peripherals,
+    units::FromValueType,
 };
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
@@ -52,11 +57,12 @@ const FRAME_BYTES: usize = HEADER_LEN + PCM_BYTES;
 const AUDIO_BUFFER_FRAMES: usize = 8;
 const DRAIN_FRAMES: usize = 8;
 const BATTERY_REFRESH_US: u64 = 30_000_000;
+const RECORDING_POWER_REFRESH_US: u64 = 1_000_000;
 const LEVEL_REFRESH_US: u64 = 200_000;
 const SETUP_BOOT_HOLD_MS: u32 = 1_200;
 const SETUP_IDLE_HOLD_MS: u32 = 2_000;
 const PUSH_TO_TALK_HOLD_MS: u32 = 450;
-const CAPTURE_THREAD_STACK: usize = 6_144;
+const CAPTURE_THREAD_STACK: usize = 12_288;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IdleAction {
@@ -141,6 +147,20 @@ fn main() -> Result<()> {
         }
     };
 
+    let backlight_timer = LedcTimerDriver::new(
+        peripherals.ledc.timer0,
+        &TimerConfig::new()
+            .frequency(25.kHz().into())
+            .resolution(Resolution::Bits8),
+    )
+    .context("create LCD backlight PWM timer")?;
+    let backlight = LedcDriver::new(
+        peripherals.ledc.channel0,
+        backlight_timer,
+        peripherals.pins.gpio38,
+    )
+    .context("create LCD backlight PWM")?;
+
     let mut display = display::StickDisplay::new(
         peripherals.spi3,
         peripherals.pins.gpio40,
@@ -148,7 +168,7 @@ fn main() -> Result<()> {
         peripherals.pins.gpio41,
         peripherals.pins.gpio45,
         peripherals.pins.gpio21,
-        peripherals.pins.gpio38,
+        backlight,
     )
     .context("create display")?;
     set_battery_from_pm1(&mut pm1_i2c, &mut display);
@@ -222,6 +242,9 @@ fn main() -> Result<()> {
     loop {
         if transport == TransportMode::Usb {
             usb_audio.set_transport(TransportMode::Usb);
+            display
+                .set_brightness(display::Brightness::Full)
+                .context("set display brightness")?;
             display.show_usb_ready().context("draw USB mic screen")?;
             match wait_for_usb_action(
                 &button_b,
@@ -235,6 +258,9 @@ fn main() -> Result<()> {
                 IdleAction::ToggleTransport | IdleAction::SetTransport(TransportMode::Wireless) => {
                     transport = TransportMode::Wireless;
                     usb_audio.set_transport(TransportMode::Wireless);
+                    display
+                        .set_brightness(display::Brightness::Full)
+                        .context("set display brightness")?;
                     refresh_battery(&mut pm1_i2c, &mut display).context("draw battery")?;
                     display.show_ready().context("draw ready screen")?;
                     info!("transport switched to wireless");
@@ -250,6 +276,10 @@ fn main() -> Result<()> {
             }
         }
 
+        usb_audio.set_transport(TransportMode::Wireless);
+        display
+            .set_brightness(display::Brightness::Full)
+            .context("set display brightness")?;
         let mode = match wait_for_idle_action(
             &button_a,
             &button_b,
@@ -263,6 +293,9 @@ fn main() -> Result<()> {
             IdleAction::ToggleTransport | IdleAction::SetTransport(TransportMode::Usb) => {
                 transport = TransportMode::Usb;
                 usb_audio.set_transport(TransportMode::Usb);
+                display
+                    .set_brightness(display::Brightness::Full)
+                    .context("set display brightness")?;
                 refresh_battery(&mut pm1_i2c, &mut display).context("draw battery")?;
                 display.show_usb_ready().context("draw USB mic screen")?;
                 info!("transport switched to USB");
@@ -277,7 +310,7 @@ fn main() -> Result<()> {
         };
         info!("recording requested: {mode:?}");
 
-        match record_once(
+        let record_result = record_once(
             &mdns,
             &mut cached_receiver,
             &usb_audio,
@@ -285,7 +318,12 @@ fn main() -> Result<()> {
             &mut display,
             &mut pm1_i2c,
             mode,
-        ) {
+        );
+        display
+            .set_brightness(display::Brightness::Full)
+            .context("set display brightness")?;
+
+        match record_result {
             Ok(()) => {
                 info!("recording stopped");
                 refresh_battery(&mut pm1_i2c, &mut display).context("draw battery")?;
@@ -523,12 +561,24 @@ fn stream_audio_connected(
 ) -> Result<()> {
     drain_i2s(audio, DRAIN_FRAMES).context("drain pre-stream audio")?;
     refresh_battery(pm1_i2c, display).context("draw battery")?;
+    let live_meters = display.external_power();
+    let track_level = AtomicBool::new(live_meters);
+    let brightness = if live_meters {
+        display::Brightness::Full
+    } else {
+        display::Brightness::Dim
+    };
     display
-        .show_recording(0, mode.display_mode())
+        .set_brightness(brightness)
+        .context("set recording brightness")?;
+    display
+        .show_recording(0, mode.display_mode(), live_meters)
         .context("draw recording screen")?;
-    display
-        .update_buffer(0, AUDIO_BUFFER_FRAMES)
-        .context("draw buffer meter")?;
+    if live_meters {
+        display
+            .update_buffer(0, AUDIO_BUFFER_FRAMES)
+            .context("draw buffer meter")?;
+    }
 
     let stream_id = next_stream_id();
     let (tx, rx) = sync_channel::<CapturedFrame>(AUDIO_BUFFER_FRAMES);
@@ -542,7 +592,15 @@ fn stream_audio_connected(
             .name("m5mic-capture".to_string())
             .stack_size(CAPTURE_THREAD_STACK)
             .spawn_scoped(scope, || {
-                capture_audio_frames(audio, tx, &stop_capture, &queued_frames, stream_id, mode)
+                capture_audio_frames(
+                    audio,
+                    tx,
+                    &stop_capture,
+                    &queued_frames,
+                    stream_id,
+                    mode,
+                    &track_level,
+                )
             })
             .map_err(|err| anyhow!("spawn audio capture thread: {err}"))?;
 
@@ -554,6 +612,8 @@ fn stream_audio_connected(
             display,
             pm1_i2c,
             mode,
+            &track_level,
+            live_meters,
             &mut last_sequence,
             &mut have_sent_audio,
         );
@@ -596,6 +656,7 @@ fn capture_audio_frames(
     queued_frames: &AtomicUsize,
     stream_id: u32,
     mode: RecordMode,
+    track_level: &AtomicBool,
 ) -> Result<()> {
     let mut sequence = 0u32;
     let mut first = true;
@@ -603,7 +664,9 @@ fn capture_audio_frames(
     while !stop_capture.load(Ordering::Relaxed) {
         let mut frame = CapturedFrame::new(sequence);
         audio.read_exact(&mut frame.bytes[HEADER_LEN..])?;
-        frame.level = pcm_peak_percent(&frame.bytes[HEADER_LEN..]);
+        if track_level.load(Ordering::Relaxed) {
+            frame.level = pcm_peak_percent(&frame.bytes[HEADER_LEN..]);
+        }
 
         let mut flags = mode_flags(mode);
         if first {
@@ -645,12 +708,14 @@ fn send_captured_audio(
     display: &mut display::StickDisplay<'_>,
     pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
     mode: RecordMode,
+    track_level: &AtomicBool,
+    mut live_meters: bool,
     last_sequence: &mut u32,
     have_sent_audio: &mut bool,
 ) -> Result<StreamStop> {
     let started_us = esp_timer_us();
     let mut last_elapsed_secs = 0;
-    let mut next_battery_refresh_us = started_us.saturating_add(BATTERY_REFRESH_US);
+    let mut next_battery_refresh_us = started_us.saturating_add(RECORDING_POWER_REFRESH_US);
     let mut next_level_refresh_us = started_us.saturating_add(LEVEL_REFRESH_US);
     let mut meter_level = 0u8;
     let mut last_buffer_frames = usize::MAX;
@@ -692,23 +757,46 @@ fn send_captured_audio(
         }
         if now_us >= next_battery_refresh_us {
             refresh_battery(pm1_i2c, display).context("draw battery")?;
-            next_battery_refresh_us = now_us.saturating_add(BATTERY_REFRESH_US);
+            let external_power = display.external_power();
+            display
+                .set_brightness(if external_power {
+                    display::Brightness::Full
+                } else {
+                    display::Brightness::Dim
+                })
+                .context("set recording brightness")?;
+
+            if external_power != live_meters {
+                live_meters = external_power;
+                track_level.store(live_meters, Ordering::Relaxed);
+                if !live_meters {
+                    meter_level = 0;
+                }
+                display
+                    .show_recording(elapsed_secs, mode.display_mode(), live_meters)
+                    .context("redraw recording screen")?;
+                last_buffer_frames = usize::MAX;
+            }
+
+            next_battery_refresh_us = now_us.saturating_add(RECORDING_POWER_REFRESH_US);
         }
-        if now_us >= next_level_refresh_us {
+        if live_meters && now_us >= next_level_refresh_us {
             display
                 .update_level(meter_level)
                 .context("draw recording level")?;
             next_level_refresh_us = now_us.saturating_add(LEVEL_REFRESH_US);
         }
 
-        let buffered = queued_frames
-            .load(Ordering::Relaxed)
-            .min(AUDIO_BUFFER_FRAMES);
-        if buffered != last_buffer_frames {
-            display
-                .update_buffer(buffered, AUDIO_BUFFER_FRAMES)
-                .context("draw buffer meter")?;
-            last_buffer_frames = buffered;
+        if live_meters {
+            let buffered = queued_frames
+                .load(Ordering::Relaxed)
+                .min(AUDIO_BUFFER_FRAMES);
+            if buffered != last_buffer_frames {
+                display
+                    .update_buffer(buffered, AUDIO_BUFFER_FRAMES)
+                    .context("draw buffer meter")?;
+                last_buffer_frames = buffered;
+            }
         }
     }
 }
@@ -813,13 +901,19 @@ fn read_battery_view(pm1_i2c: &mut Option<i2c_bus::I2cDevice>) -> display::Batte
     };
 
     match power::read_battery_status(pm1_i2c) {
-        Ok(status) => display::BatteryView {
-            percent: Some(status.percent),
-            external_power: matches!(
-                status.power_source,
-                power::PowerSource::FiveVoltIn | power::PowerSource::FiveVoltInOut
-            ),
-        },
+        Ok(status) => {
+            let input_power = power::read_input_mv(pm1_i2c)
+                .map(|(vin_mv, five_volt_mv)| vin_mv >= 4_300 || five_volt_mv >= 4_300)
+                .unwrap_or(false);
+            display::BatteryView {
+                percent: Some(status.percent),
+                external_power: input_power
+                    || matches!(
+                        status.power_source,
+                        power::PowerSource::FiveVoltIn | power::PowerSource::FiveVoltInOut
+                    ),
+            }
+        }
         Err(err) => {
             warn!("battery read failed: {err}");
             display::BatteryView::unknown()

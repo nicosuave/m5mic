@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     ffi::CStr,
     mem::size_of,
     net::{Ipv4Addr, SocketAddrV4, UdpSocket},
@@ -11,6 +12,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use coreaudio_sys::*;
+use if_addrs::{get_if_addrs, IfAddr};
 use m5mic_protocol::{
     CONTROL_MODE_USB, CONTROL_MODE_WIRELESS, CONTROL_PORT, DISCOVERY_PORT, WS_PORT,
 };
@@ -608,19 +610,55 @@ fn send_device_mode(mode: InputMode) -> Result<()> {
         InputMode::Wireless => CONTROL_MODE_WIRELESS,
         InputMode::Usb => CONTROL_MODE_USB,
     };
-    let target = SocketAddrV4::new(Ipv4Addr::BROADCAST, CONTROL_PORT);
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
         .context("bind mode control socket")?;
     socket.set_broadcast(true).context("enable broadcast")?;
 
-    for _ in 0..3 {
-        socket
-            .send_to(payload, target)
-            .context("send mode control packet")?;
-        thread::sleep(Duration::from_millis(25));
+    let targets = mode_control_targets();
+    for _ in 0..8 {
+        for target in &targets {
+            socket
+                .send_to(payload, target)
+                .with_context(|| format!("send mode control packet to {target}"))?;
+        }
+        thread::sleep(Duration::from_millis(75));
     }
 
     Ok(())
+}
+
+fn mode_control_targets() -> Vec<SocketAddrV4> {
+    let mut targets = BTreeSet::from([SocketAddrV4::new(Ipv4Addr::BROADCAST, CONTROL_PORT)]);
+
+    match get_if_addrs() {
+        Ok(addrs) => {
+            for iface in addrs {
+                if iface.is_loopback() {
+                    continue;
+                }
+                let IfAddr::V4(addr) = iface.addr else {
+                    continue;
+                };
+
+                targets.insert(SocketAddrV4::new(
+                    ipv4_broadcast(addr.ip, addr.netmask),
+                    CONTROL_PORT,
+                ));
+                if let Some(broadcast) = addr.broadcast {
+                    targets.insert(SocketAddrV4::new(broadcast, CONTROL_PORT));
+                }
+            }
+        }
+        Err(err) => tracing::debug!(?err, "failed to enumerate network interfaces"),
+    }
+
+    targets.into_iter().collect()
+}
+
+fn ipv4_broadcast(ip: Ipv4Addr, netmask: Ipv4Addr) -> Ipv4Addr {
+    let ip = u32::from(ip);
+    let mask = u32::from(netmask);
+    Ipv4Addr::from(ip | !mask)
 }
 
 fn usb_status() -> UsbStatus {

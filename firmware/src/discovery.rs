@@ -16,16 +16,20 @@ pub fn discover_server(mdns: &EspMdns, mut on_progress: impl FnMut(usize)) -> Re
         return Ok(url.to_string());
     }
 
-    if let Ok(url) = discover_mdns(mdns, &mut on_progress) {
+    if let Ok(url) = discover_udp(&mut on_progress, 0) {
         return Ok(url);
     }
 
-    discover_udp(on_progress)
+    discover_mdns(mdns, &mut on_progress, 8)
 }
 
-fn discover_mdns(mdns: &EspMdns, on_progress: &mut impl FnMut(usize)) -> Result<String> {
+fn discover_mdns(
+    mdns: &EspMdns,
+    on_progress: &mut impl FnMut(usize),
+    start_step: usize,
+) -> Result<String> {
     for step in 0..6 {
-        on_progress(step);
+        on_progress(start_step + step);
         let mut results = [
             empty_query_result(),
             empty_query_result(),
@@ -61,7 +65,7 @@ fn discover_mdns(mdns: &EspMdns, on_progress: &mut impl FnMut(usize)) -> Result<
     Err(anyhow!("no mDNS receiver found"))
 }
 
-fn discover_udp(mut on_progress: impl FnMut(usize)) -> Result<String> {
+fn discover_udp(on_progress: &mut impl FnMut(usize), start_step: usize) -> Result<String> {
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
         .context("bind udp discovery socket")?;
     socket.set_broadcast(true).context("enable udp broadcast")?;
@@ -72,8 +76,8 @@ fn discover_udp(mut on_progress: impl FnMut(usize)) -> Result<String> {
     let target = SocketAddrV4::new(Ipv4Addr::BROADCAST, DISCOVERY_PORT);
 
     let mut buf = [0u8; 256];
-    for step in 6..14 {
-        on_progress(step);
+    for step in 0..8 {
+        on_progress(start_step + step);
         socket
             .send_to(DISCOVERY_REQUEST, target)
             .context("send udp discovery")?;

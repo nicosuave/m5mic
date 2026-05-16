@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use esp_idf_hal::{
     delay::FreeRtos,
     gpio::{AnyInputPin, Output, OutputPin, PinDriver},
+    ledc::LedcDriver,
     spi::{config, SpiAnyPins, SpiDeviceDriver, SpiDriver, SpiDriverConfig},
     units::FromValueType,
 };
@@ -27,6 +28,8 @@ const RED: u16 = rgb565(239, 46, 70);
 const RED_SOFT: u16 = rgb565(150, 27, 49);
 const RED_DARK: u16 = rgb565(66, 13, 27);
 const LINE: u16 = rgb565(36, 50, 78);
+const BACKLIGHT_FULL_PERCENT: u32 = 100;
+const BACKLIGHT_DIM_PERCENT: u32 = 18;
 
 const fn rgb565(r: u8, g: u8, b: u8) -> u16 {
     (((r as u16) & 0xf8) << 8) | (((g as u16) & 0xfc) << 3) | ((b as u16) >> 3)
@@ -36,7 +39,7 @@ pub struct StickDisplay<'d> {
     spi: SpiDeviceDriver<'d, SpiDriver<'d>>,
     dc: PinDriver<'d, Output>,
     reset: PinDriver<'d, Output>,
-    backlight: PinDriver<'d, Output>,
+    backlight: LedcDriver<'d>,
     battery: BatteryView,
 }
 
@@ -52,6 +55,12 @@ pub enum RecordModeView {
     PushToTalk,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Brightness {
+    Full,
+    Dim,
+}
+
 impl BatteryView {
     pub const fn unknown() -> Self {
         Self {
@@ -63,14 +72,14 @@ impl BatteryView {
 
 impl<'d> StickDisplay<'d> {
     #[allow(clippy::too_many_arguments)]
-    pub fn new<SPI, SCLK, MOSI, CS, DC, RST, BL>(
+    pub fn new<SPI, SCLK, MOSI, CS, DC, RST>(
         spi: SPI,
         sclk: SCLK,
         mosi: MOSI,
         cs: CS,
         dc: DC,
         reset: RST,
-        backlight: BL,
+        backlight: LedcDriver<'d>,
     ) -> Result<Self>
     where
         SPI: SpiAnyPins + 'd,
@@ -79,7 +88,6 @@ impl<'d> StickDisplay<'d> {
         CS: OutputPin + 'd,
         DC: OutputPin + 'd,
         RST: OutputPin + 'd,
-        BL: OutputPin + 'd,
     {
         let config = config::Config::new()
             .baudrate(40.MHz().into())
@@ -99,7 +107,7 @@ impl<'d> StickDisplay<'d> {
             spi,
             dc: PinDriver::output(dc).context("create LCD DC")?,
             reset: PinDriver::output(reset).context("create LCD reset")?,
-            backlight: PinDriver::output(backlight).context("create LCD backlight")?,
+            backlight,
             battery: BatteryView::unknown(),
         };
         display.init().context("init LCD")?;
@@ -114,6 +122,17 @@ impl<'d> StickDisplay<'d> {
         self.battery = battery;
         self.fill_rect(82, 0, 53, HEADER_HEIGHT, PANEL)?;
         self.draw_battery()
+    }
+
+    pub fn external_power(&self) -> bool {
+        self.battery.external_power
+    }
+
+    pub fn set_brightness(&mut self, brightness: Brightness) -> Result<()> {
+        match brightness {
+            Brightness::Full => self.set_backlight_percent(BACKLIGHT_FULL_PERCENT),
+            Brightness::Dim => self.set_backlight_percent(BACKLIGHT_DIM_PERCENT),
+        }
     }
 
     pub fn show_wifi_connecting(&mut self) -> Result<()> {
@@ -172,12 +191,30 @@ impl<'d> StickDisplay<'d> {
         self.draw_centered("REBOOTING", 221, 1, MUTED)
     }
 
-    pub fn show_recording(&mut self, elapsed_secs: u64, mode: RecordModeView) -> Result<()> {
+    pub fn show_setup_rebooting(&mut self) -> Result<()> {
+        self.base_with_net(CYAN, false)?;
+        self.draw_centered("OK", 58, 3, CYAN)?;
+        self.draw_divider(105, CYAN)?;
+        self.draw_centered("MIC", 139, 2, TEXT)?;
+        self.draw_centered("MODE", 166, 2, TEXT)?;
+        self.draw_centered("REBOOTING", 221, 1, MUTED)
+    }
+
+    pub fn show_recording(
+        &mut self,
+        elapsed_secs: u64,
+        mode: RecordModeView,
+        live_meters: bool,
+    ) -> Result<()> {
         self.base(true, true)?;
         self.draw_record_target(true)?;
         self.draw_elapsed(elapsed_secs)?;
-        self.draw_level_meter(0)?;
-        self.draw_buffer_meter(0, 1)?;
+        if live_meters {
+            self.draw_level_meter(0)?;
+            self.draw_buffer_meter(0, 1)?;
+        } else {
+            self.fill_rect(9, 161, 117, 56, BLACK)?;
+        }
         match mode {
             RecordModeView::Latched => self.draw_centered("STOP", 223, 2, MUTED),
             RecordModeView::PushToTalk => self.draw_centered("RELEASE", 223, 2, MUTED),
@@ -215,7 +252,7 @@ impl<'d> StickDisplay<'d> {
     }
 
     fn init(&mut self) -> Result<()> {
-        self.backlight.set_low().context("backlight off")?;
+        self.set_backlight_percent(0)?;
         self.reset.set_high().context("reset high")?;
         FreeRtos::delay_ms(20);
         self.reset.set_low().context("reset low")?;
@@ -233,7 +270,12 @@ impl<'d> StickDisplay<'d> {
         self.clear(BLACK)?;
         self.command(0x29, &[])?; // Display on
         FreeRtos::delay_ms(20);
-        self.backlight.set_high().context("backlight on")
+        self.set_brightness(Brightness::Full)
+    }
+
+    fn set_backlight_percent(&mut self, percent: u32) -> Result<()> {
+        let duty = self.backlight.get_max_duty() * percent.min(100) / 100;
+        self.backlight.set_duty(duty).context("set LCD backlight")
     }
 
     fn base(&mut self, wifi: bool, recording: bool) -> Result<()> {
