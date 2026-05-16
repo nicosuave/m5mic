@@ -32,11 +32,21 @@ The normal Mac workflow is the menu-bar app plus the CoreAudio driver. The app s
 
 Install the CoreAudio driver. macOS loads HAL plug-ins from the system audio plug-in directory, so this uses `sudo`:
 
+Download the latest notarized macOS release from [GitHub Releases](https://github.com/nicosuave/m5mic/releases/latest). Unzip it, drag `m5mic.app` to `/Applications`, then install the virtual mic driver:
+
+```sh
+./install-driver.sh
+```
+
+Open `/Applications/m5mic.app` after the driver is installed.
+
+To build from source instead:
+
 ```sh
 scripts/install-coreaudio-driver.sh
 ```
 
-Build and open the app:
+Then build and open the app:
 
 ```sh
 scripts/build-statusbar-app.sh
@@ -56,7 +66,7 @@ Uninstall the driver:
 scripts/uninstall-coreaudio-driver.sh
 ```
 
-## Local Release
+## Maintainer Release
 
 `scripts/release-local.sh` builds a signed release zip containing `m5mic.app`, `m5mic.driver`, and install/uninstall scripts. It uses a local Developer ID Application certificate and optionally notarizes through a local `notarytool` Keychain profile. No Apple credentials need to go into GitHub.
 
