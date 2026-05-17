@@ -5,14 +5,23 @@ use btleplug::{
     api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanFilter, WriteType},
     platform::{Adapter, Manager, Peripheral},
 };
+use chacha20poly1305::{
+    aead::{Aead, Payload},
+    ChaCha20Poly1305, KeyInit, Nonce,
+};
 use futures_util::StreamExt;
+use hkdf::Hkdf;
 use m5mic_protocol::{
     BleAudioFragmentHeader, BLE_AUDIO_CHARACTERISTIC_UUID, BLE_CONTROL_CHARACTERISTIC_UUID,
-    BLE_SERVICE_UUID,
+    BLE_PROVISION_CHARACTERISTIC_UUID, BLE_PROVISION_CODE_DIGITS, BLE_PROVISION_INFO_MAGIC,
+    BLE_PROVISION_NONCE_LEN, BLE_PROVISION_SALT_LEN, BLE_PROVISION_WIFI_MAGIC, BLE_SERVICE_UUID,
 };
 use m5mic_receiver::{LiveAudioOutput, LiveAudioStatus};
+use sha2::Sha256;
 use tokio::{sync::watch, time};
 use uuid::Uuid;
+
+const PROVISION_KEY_INFO: &[u8] = b"m5mic ble wifi v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BleReceiverStatus {
@@ -74,6 +83,56 @@ pub async fn send_mode_command(payload: &'static [u8]) -> Result<()> {
         .write(&control_characteristic, payload, WriteType::WithResponse)
         .await
         .context("write Bluetooth mode command")
+}
+
+pub async fn provision_wifi(ssid: &str, password: &str, setup_code: &str) -> Result<()> {
+    validate_wifi_credentials(ssid, password)?;
+    let code = normalize_setup_code(setup_code)?;
+    let service_uuid = Uuid::parse_str(BLE_SERVICE_UUID).context("parse BLE service UUID")?;
+    let provision_uuid =
+        Uuid::parse_str(BLE_PROVISION_CHARACTERISTIC_UUID).context("parse BLE provision UUID")?;
+    let manager = Manager::new().await.context("create Bluetooth manager")?;
+    let adapter = first_adapter(&manager).await?;
+    let peripheral = find_m5mic(&adapter, service_uuid).await?;
+
+    if !peripheral
+        .is_connected()
+        .await
+        .context("check Bluetooth connection")?
+    {
+        peripheral
+            .connect()
+            .await
+            .context("connect Bluetooth m5mic")?;
+    }
+    peripheral
+        .discover_services()
+        .await
+        .context("discover Bluetooth services")?;
+
+    let provision_characteristic = peripheral
+        .characteristics()
+        .into_iter()
+        .find(|characteristic| {
+            characteristic.uuid == provision_uuid
+                && characteristic.properties.contains(CharPropFlags::READ)
+                && (characteristic.properties.contains(CharPropFlags::WRITE)
+                    || characteristic
+                        .properties
+                        .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE))
+        })
+        .ok_or_else(|| anyhow!("m5mic Bluetooth provisioning characteristic not found"))?;
+
+    let info = peripheral
+        .read(&provision_characteristic)
+        .await
+        .context("read Bluetooth provisioning info")?;
+    let salt = parse_provisioning_info(&info)?;
+    let payload = encrypted_wifi_payload(ssid, password, &code, salt)?;
+    peripheral
+        .write(&provision_characteristic, &payload, WriteType::WithResponse)
+        .await
+        .context("write Bluetooth Wi-Fi provisioning payload")
 }
 
 async fn run_once(status_tx: &watch::Sender<BleReceiverStatus>) -> Result<()> {
@@ -154,6 +213,90 @@ async fn run_once(status_tx: &watch::Sender<BleReceiverStatus>) -> Result<()> {
     live_audio.set_idle();
     let _ = peripheral.disconnect().await;
     Ok(())
+}
+
+fn validate_wifi_credentials(ssid: &str, password: &str) -> Result<()> {
+    if ssid.is_empty() {
+        return Err(anyhow!("Wi-Fi name is required"));
+    }
+    if ssid.len() > 32 {
+        return Err(anyhow!("Wi-Fi name is too long"));
+    }
+    if password.len() > 64 {
+        return Err(anyhow!("Wi-Fi password is too long"));
+    }
+    Ok(())
+}
+
+fn normalize_setup_code(input: &str) -> Result<[u8; BLE_PROVISION_CODE_DIGITS]> {
+    let mut code = [0u8; BLE_PROVISION_CODE_DIGITS];
+    let mut count = 0;
+    for byte in input.bytes() {
+        if byte == b' ' || byte == b'-' {
+            continue;
+        }
+        if !byte.is_ascii_digit() || count == code.len() {
+            return Err(anyhow!("Bluetooth setup code must be 8 digits"));
+        }
+        code[count] = byte;
+        count += 1;
+    }
+    if count != code.len() {
+        return Err(anyhow!("Bluetooth setup code must be 8 digits"));
+    }
+    Ok(code)
+}
+
+fn parse_provisioning_info(info: &[u8]) -> Result<&[u8; BLE_PROVISION_SALT_LEN]> {
+    let expected_len = BLE_PROVISION_INFO_MAGIC.len() + BLE_PROVISION_SALT_LEN;
+    if info.len() != expected_len {
+        return Err(anyhow!("bad Bluetooth provisioning info length"));
+    }
+    if &info[..BLE_PROVISION_INFO_MAGIC.len()] != BLE_PROVISION_INFO_MAGIC {
+        return Err(anyhow!("bad Bluetooth provisioning info magic"));
+    }
+    info[BLE_PROVISION_INFO_MAGIC.len()..]
+        .try_into()
+        .map_err(|_| anyhow!("bad Bluetooth provisioning salt"))
+}
+
+fn encrypted_wifi_payload(
+    ssid: &str,
+    password: &str,
+    code: &[u8; BLE_PROVISION_CODE_DIGITS],
+    salt: &[u8; BLE_PROVISION_SALT_LEN],
+) -> Result<Vec<u8>> {
+    let mut plaintext = Vec::with_capacity(2 + ssid.len() + password.len());
+    plaintext.push(ssid.len() as u8);
+    plaintext.push(password.len() as u8);
+    plaintext.extend_from_slice(ssid.as_bytes());
+    plaintext.extend_from_slice(password.as_bytes());
+
+    let mut key = [0u8; 32];
+    let hkdf = Hkdf::<Sha256>::new(Some(salt), code);
+    hkdf.expand(PROVISION_KEY_INFO, &mut key)
+        .map_err(|_| anyhow!("derive Bluetooth provisioning key"))?;
+    let cipher = ChaCha20Poly1305::new_from_slice(&key)
+        .map_err(|_| anyhow!("create Bluetooth provisioning cipher"))?;
+    let mut nonce = [0u8; BLE_PROVISION_NONCE_LEN];
+    getrandom::fill(&mut nonce).context("generate Bluetooth provisioning nonce")?;
+    let encrypted = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &plaintext,
+                aad: BLE_PROVISION_WIFI_MAGIC,
+            },
+        )
+        .map_err(|_| anyhow!("encrypt Wi-Fi credentials"))?;
+
+    let mut payload = Vec::with_capacity(
+        BLE_PROVISION_WIFI_MAGIC.len() + BLE_PROVISION_NONCE_LEN + encrypted.len(),
+    );
+    payload.extend_from_slice(BLE_PROVISION_WIFI_MAGIC);
+    payload.extend_from_slice(&nonce);
+    payload.extend_from_slice(&encrypted);
+    Ok(payload)
 }
 
 async fn first_adapter(manager: &Manager) -> Result<Adapter> {

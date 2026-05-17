@@ -43,7 +43,7 @@ In wireless mode, the firmware discovers the receiver in this order:
 2. mDNS query for `_m5mic._tcp.local`.
 3. UDP broadcast on `255.255.255.255:47777`.
 
-Wireless audio is mono, 16 kHz. Wi-Fi sends 40 ms binary WebSocket frames, with the setup portal controlling `pcm_s16le` by default or `ima_adpcm4` for smaller payloads. Bluetooth uses the custom m5mic BLE GATT service and sends fragmented `ima_adpcm4` frames by notification. Bluetooth needs no captive-portal setup, Wi-Fi password, or pairing; switch to it with BtnB or the menu-bar app. The menu-bar app can send mode commands over BLE control writes when Wi-Fi UDP is unavailable. The receiver/menu-bar app decodes ADPCM back to PCM before feeding the virtual microphone.
+Wireless audio is mono, 16 kHz. Wi-Fi sends 40 ms binary WebSocket frames, with the setup portal controlling `pcm_s16le` by default or `ima_adpcm4` for smaller payloads. Bluetooth uses the custom m5mic BLE GATT service and sends fragmented `ima_adpcm4` frames by notification. Bluetooth needs no OS pairing; switch to it with BtnB or the menu-bar app. The setup screen shows an 8-digit Bluetooth setup code, and the menu-bar app can share the Mac's current Wi-Fi network over an encrypted BLE provisioning write using that code. On macOS, the app reads the current SSID, tries non-interactive user keychain password lookup, and falls back to asking for the password and setup code without making you retype the network name. The menu-bar app can also send mode commands over BLE control writes when Wi-Fi UDP is unavailable. The receiver/menu-bar app decodes ADPCM back to PCM before feeding the virtual microphone.
 
 In wireless mode, press BtnA to start recording. Press BtnA again to stop and close the current WAV on the receiver.
 

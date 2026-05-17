@@ -173,7 +173,7 @@ impl<'d> StickDisplay<'d> {
         self.draw_record_target(false)?;
         self.draw_centered("TAP", 139, 3, TEXT)?;
         self.draw_centered("START", 168, 2, RED)?;
-        self.draw_centered("BLUETOOTH", 219, 1, MUTED)
+        self.draw_centered("HOLD B SETUP", 219, 1, MUTED)
     }
 
     pub fn show_finding_receiver(&mut self, transport: TransportView) -> Result<()> {
@@ -193,13 +193,22 @@ impl<'d> StickDisplay<'d> {
         self.draw_centered("WAIT", 221, 1, MUTED)
     }
 
-    pub fn show_setup_portal(&mut self, ssid: &str) -> Result<()> {
+    pub fn show_setup_portal(&mut self, ssid: &str, setup_code: Option<u32>) -> Result<()> {
         self.base_setup(false)?;
-        self.draw_centered("SETUP", 55, 2, CYAN)?;
-        self.draw_centered("JOIN WIFI", 91, 2, TEXT)?;
-        self.draw_divider(124, CYAN)?;
-        self.draw_centered(ssid, 151, 1, AMBER)?;
-        self.draw_centered("192.168.71.1", 221, 1, MUTED)
+        if let Some(setup_code) = setup_code {
+            self.draw_centered("BT SETUP", 47, 2, CYAN)?;
+            self.draw_setup_code_large(setup_code, 76)?;
+            self.draw_divider(145, CYAN)?;
+            self.draw_centered("OR JOIN AP", 156, 1, MUTED)?;
+            self.draw_centered(ssid, 173, 1, AMBER)?;
+            self.draw_centered("192.168.71.1", 221, 1, MUTED)
+        } else {
+            self.draw_centered("SETUP", 55, 2, CYAN)?;
+            self.draw_centered("JOIN WIFI", 91, 2, TEXT)?;
+            self.draw_divider(124, CYAN)?;
+            self.draw_centered(ssid, 151, 1, AMBER)?;
+            self.draw_centered("192.168.71.1", 221, 1, MUTED)
+        }
     }
 
     pub fn show_setup_saved(&mut self) -> Result<()> {
@@ -517,6 +526,19 @@ impl<'d> StickDisplay<'d> {
         text[4] = b'0' + (seconds % 10) as u8;
         let text = core::str::from_utf8(&text).unwrap();
         self.draw_centered(text, 123, 4, TEXT)
+    }
+
+    fn draw_setup_code_large(&mut self, setup_code: u32, y: i32) -> Result<()> {
+        let mut digits = *b"00000000";
+        let mut value = setup_code % 100_000_000;
+        for index in (0..digits.len()).rev() {
+            digits[index] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+        let first = core::str::from_utf8(&digits[..4]).unwrap();
+        let second = core::str::from_utf8(&digits[4..]).unwrap();
+        self.draw_centered(first, y, 3, TEXT)?;
+        self.draw_centered(second, y + 31, 3, TEXT)
     }
 
     fn clear(&mut self, color: u16) -> Result<()> {

@@ -68,12 +68,13 @@ const SETUP_IDLE_HOLD_MS: u32 = 2_000;
 const PUSH_TO_TALK_HOLD_MS: u32 = 450;
 const CAPTURE_THREAD_STACK: usize = 12_288;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 enum IdleAction {
     Record(RecordMode),
     Setup,
     CycleMode,
     SetMode(ActiveMode),
+    ProvisionWifi(ble::ProvisionedWifi),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,9 +89,10 @@ enum RecordMode {
     PushToTalk,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 enum ModeCommand {
     SetMode(ActiveMode),
+    ProvisionWifi(ble::ProvisionedWifi),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -224,12 +226,20 @@ fn main() -> Result<()> {
 
     if button_held(&button_b, SETUP_BOOT_HOLD_MS) {
         info!("BtnB held at boot; entering setup portal");
+        let setup_ble = match ble::BleAudioServer::start() {
+            Ok(server) => Some(server),
+            Err(err) => {
+                warn!("Bluetooth setup server failed to start: {err:#}");
+                None
+            }
+        };
         setup::run(
             &mut wifi,
             wifi_store.clone(),
             &mut display,
             &setup_ssid,
             &button_b,
+            setup_ble.as_ref(),
         )?;
         return Ok(());
     }
@@ -333,14 +343,50 @@ fn main() -> Result<()> {
                 info!("mode switched to {}", active_mode.label());
                 continue;
             }
+            IdleAction::ProvisionWifi(credentials) => {
+                wifi_store
+                    .save(&wifi_config::WifiCredentials {
+                        ssid: credentials.ssid,
+                        password: credentials.password,
+                    })
+                    .context("save Bluetooth-provisioned Wi-Fi")?;
+                display
+                    .show_setup_saved()
+                    .context("draw Bluetooth Wi-Fi saved screen")?;
+                FreeRtos::delay_ms(900);
+                let _ = wifi.disconnect();
+                let _ = wifi.stop();
+                mdns = None;
+                active_mode = ActiveMode::Wifi;
+                activate_mode(
+                    active_mode,
+                    &mut wifi,
+                    &wifi_store,
+                    &mut mdns,
+                    &mut ble_audio,
+                    &mut display,
+                    &mut pm1_i2c,
+                    &usb_audio,
+                    &app_settings,
+                )?;
+                info!("Bluetooth Wi-Fi provisioning saved; switched to Wi-Fi");
+                continue;
+            }
             IdleAction::Setup => {
                 info!("BtnB held while idle; entering setup portal");
+                if ble_audio.is_none() {
+                    match ble::BleAudioServer::start() {
+                        Ok(server) => ble_audio = Some(server),
+                        Err(err) => warn!("Bluetooth setup server failed to start: {err:#}"),
+                    }
+                }
                 setup::run(
                     &mut wifi,
                     wifi_store.clone(),
                     &mut display,
                     &setup_ssid,
                     &button_b,
+                    ble_audio.as_ref(),
                 )?;
                 return Ok(());
             }
@@ -521,6 +567,9 @@ fn poll_mode_control(
     let Some(ble_audio) = ble_audio else {
         return Ok(None);
     };
+    if let Some(credentials) = ble_audio.take_provisioned_wifi() {
+        return Ok(Some(ModeCommand::ProvisionWifi(credentials)));
+    }
     Ok(ble_audio.take_mode_command().map(|command| match command {
         ble::BleModeCommand::Usb => ModeCommand::SetMode(ActiveMode::Usb),
         ble::BleModeCommand::Wifi => ModeCommand::SetMode(ActiveMode::Wifi),
@@ -1568,6 +1617,9 @@ fn wait_for_idle_action(
         if let Some(command) = poll_mode_control(control_socket, ble_audio)? {
             match command {
                 ModeCommand::SetMode(mode) => return Ok(IdleAction::SetMode(mode)),
+                ModeCommand::ProvisionWifi(credentials) => {
+                    return Ok(IdleAction::ProvisionWifi(credentials));
+                }
             }
         }
 
@@ -1605,6 +1657,9 @@ fn wait_for_usb_action(
                 ModeCommand::SetMode(ActiveMode::Usb) => {}
                 ModeCommand::SetMode(mode) => {
                     return Ok(IdleAction::SetMode(mode));
+                }
+                ModeCommand::ProvisionWifi(credentials) => {
+                    return Ok(IdleAction::ProvisionWifi(credentials));
                 }
             }
         }

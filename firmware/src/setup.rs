@@ -28,6 +28,7 @@ use esp_idf_svc::{
 use log::{info, warn};
 
 use crate::{
+    ble::BleAudioServer,
     display::StickDisplay,
     wifi_config::{AppSettings, BatteryBrightness, WifiCredentials, WifiStore, WirelessCodec},
 };
@@ -95,15 +96,16 @@ pub fn run(
     display: &mut StickDisplay<'_>,
     ssid: &str,
     button_b: &PinDriver<Input>,
+    ble_audio: Option<&BleAudioServer>,
 ) -> Result<()> {
     display
-        .show_setup_portal(ssid)
+        .show_setup_portal(ssid, ble_audio.map(BleAudioServer::provision_code))
         .context("draw setup portal screen")?;
     start_ap(wifi, ssid).context("start setup AP")?;
     spawn_dns_server();
     let saved = Arc::new(AtomicBool::new(false));
     let reboot = Arc::new(AtomicBool::new(false));
-    let _server = start_http_server(store, saved.clone(), reboot.clone())
+    let _server = start_http_server(store.clone(), saved.clone(), reboot.clone())
         .context("start setup http server")?;
     wait_for_button_release(button_b);
 
@@ -111,6 +113,19 @@ pub fn run(
     loop {
         if consume_button_click(button_b) {
             reboot.store(true, Ordering::SeqCst);
+        }
+        if let Some(credentials) = ble_audio.and_then(BleAudioServer::take_provisioned_wifi) {
+            info!(
+                "Bluetooth Wi-Fi provisioning received in setup for SSID {}",
+                credentials.ssid
+            );
+            store
+                .save(&WifiCredentials {
+                    ssid: credentials.ssid,
+                    password: credentials.password,
+                })
+                .context("save Bluetooth-provisioned Wi-Fi")?;
+            saved.store(true, Ordering::SeqCst);
         }
         if saved.load(Ordering::SeqCst) {
             display

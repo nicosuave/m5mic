@@ -2,6 +2,7 @@ mod ble;
 
 use std::{
     collections::BTreeSet,
+    env,
     ffi::CStr,
     mem::size_of,
     net::{Ipv4Addr, SocketAddrV4, UdpSocket},
@@ -19,6 +20,15 @@ use m5mic_protocol::{
     CONTROL_MODE_BLE, CONTROL_MODE_USB, CONTROL_MODE_WIFI, CONTROL_PORT, DISCOVERY_PORT, WS_PORT,
 };
 use m5mic_receiver::{run, ReceiverConfig, ReceiverStatus};
+use objc2::rc::Retained;
+use objc2_core_location::{CLAuthorizationStatus, CLLocationManager};
+use objc2_core_wlan::{CWKeychainDomain, CWKeychainFindWiFiPassword};
+use objc2_foundation::{NSData, NSString};
+use security_framework::{
+    item::{ItemClass, ItemSearchOptions, SearchResult},
+    os::macos::keychain::SecKeychain,
+};
+use serde_json::Value;
 use tokio::{
     runtime::{Handle, Runtime},
     sync::watch,
@@ -61,6 +71,7 @@ enum UserEvent {
     Usb(UsbStatus),
     Driver(DriverStatus),
     DriverInstall(DriverInstallResult),
+    WifiProvision(WifiProvisionResult),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +93,35 @@ enum DriverInstallResult {
     Installed,
     Skipped,
     Failed(String),
+}
+
+#[derive(Debug)]
+enum WifiProvisionResult {
+    Sent,
+    Skipped,
+    Failed(String),
+}
+
+#[derive(Debug)]
+struct WifiProvisionRequest {
+    ssid: String,
+    password: String,
+    setup_code: String,
+}
+
+#[derive(Debug)]
+struct WifiNetwork {
+    ssid: String,
+    ssid_bytes: Option<Vec<u8>>,
+}
+
+impl WifiNetwork {
+    fn named(ssid: String) -> Self {
+        Self {
+            ssid,
+            ssid_bytes: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,6 +248,8 @@ fn main() -> Result<()> {
         MenuItem::with_id("install-driver", "Install Audio Driver...", true, None);
     let usb_status_item = MenuItem::new("USB: checking", false, None);
     let bluetooth_status_item = MenuItem::new("Bluetooth: starting", false, None);
+    let provision_wifi_item =
+        MenuItem::with_id("provision-wifi", "Send Wi-Fi over Bluetooth...", true, None);
     let wifi_mode_item = MenuItem::with_id("mode-wifi", "Use Wi-Fi Mode", true, None);
     let bluetooth_mode_item = MenuItem::with_id("mode-bluetooth", "Use Bluetooth Mode", true, None);
     let usb_mode_item = MenuItem::with_id("mode-usb", "Use USB Mode", true, None);
@@ -224,6 +266,8 @@ fn main() -> Result<()> {
         .context("add USB status menu item")?;
     menu.append(&bluetooth_status_item)
         .context("add Bluetooth status menu item")?;
+    menu.append(&provision_wifi_item)
+        .context("add Bluetooth Wi-Fi provisioning item")?;
     menu.append(&wifi_mode_item)
         .context("add Wi-Fi mode menu item")?;
     menu.append(&bluetooth_mode_item)
@@ -244,6 +288,7 @@ fn main() -> Result<()> {
     let mut latest_ble_status = ble::BleReceiverStatus::Starting;
     let mut driver_install_running = false;
     let mut driver_install_prompted = false;
+    let mut location_manager: Option<Retained<CLLocationManager>> = None;
     sync_driver_menu(
         &driver_status_item,
         &install_driver_item,
@@ -343,6 +388,18 @@ fn main() -> Result<()> {
                 driver_install_running,
             );
         }
+        Event::UserEvent(UserEvent::WifiProvision(result)) => match result {
+            WifiProvisionResult::Sent => {
+                status_item.set_text("Status: Wi-Fi sent over Bluetooth");
+            }
+            WifiProvisionResult::Skipped => {
+                status_item.set_text("Status: Wi-Fi setup canceled");
+            }
+            WifiProvisionResult::Failed(err) => {
+                tracing::warn!(?err, "Bluetooth Wi-Fi provisioning failed");
+                status_item.set_text("Status: Bluetooth Wi-Fi setup failed");
+            }
+        },
         Event::UserEvent(UserEvent::Menu(event)) => {
             if event.id == MenuId::from("sound-settings") {
                 open_sound_settings();
@@ -357,6 +414,15 @@ fn main() -> Result<()> {
             } else if event.id == MenuId::from("mode-usb") {
                 set_menu_input_mode(InputMode::Usb, &status_item);
                 spawn_ble_mode_command(&runtime_handle, InputMode::Usb);
+            } else if event.id == MenuId::from("provision-wifi") {
+                status_item.set_text("Status: setting up Wi-Fi over Bluetooth");
+                let wait_for_location =
+                    request_location_authorization_if_needed(&mut location_manager);
+                spawn_wifi_provision_prompt(
+                    event_proxy.clone(),
+                    runtime_handle.clone(),
+                    wait_for_location,
+                );
             } else if event.id == MenuId::from("install-driver") && !driver_install_running {
                 driver_install_running = true;
                 status_item.set_text("Status: installing audio driver");
@@ -583,6 +649,378 @@ fn spawn_driver_install_prompt(proxy: EventLoopProxy<UserEvent>) {
     });
 }
 
+fn spawn_wifi_provision_prompt(
+    proxy: EventLoopProxy<UserEvent>,
+    runtime: Handle,
+    wait_for_location: bool,
+) {
+    thread::spawn(move || {
+        wait_for_location_authorization_if_needed(wait_for_location);
+        let result = match run_wifi_provision_prompt() {
+            Ok(Some(request)) => match runtime.block_on(ble::provision_wifi(
+                &request.ssid,
+                &request.password,
+                &request.setup_code,
+            )) {
+                Ok(()) => WifiProvisionResult::Sent,
+                Err(err) => WifiProvisionResult::Failed(err.to_string()),
+            },
+            Ok(None) => WifiProvisionResult::Skipped,
+            Err(err) => WifiProvisionResult::Failed(err.to_string()),
+        };
+        let _ = proxy.send_event(UserEvent::WifiProvision(result));
+    });
+}
+
+fn request_location_authorization_if_needed(
+    manager: &mut Option<Retained<CLLocationManager>>,
+) -> bool {
+    let location_services_enabled = unsafe { CLLocationManager::locationServicesEnabled_class() };
+    if !location_services_enabled {
+        tracing::debug!("location services disabled; current Wi-Fi may be unavailable");
+        return false;
+    }
+
+    let manager = manager.get_or_insert_with(|| unsafe { CLLocationManager::new() });
+    let status = unsafe { manager.authorizationStatus() };
+    if status == CLAuthorizationStatus::NotDetermined {
+        unsafe { manager.requestWhenInUseAuthorization() };
+        return true;
+    }
+
+    tracing::debug!(?status, "location authorization already determined");
+    false
+}
+
+fn wait_for_location_authorization_if_needed(wait_for_location: bool) {
+    if !wait_for_location {
+        return;
+    }
+
+    let manager = unsafe { CLLocationManager::new() };
+    for _ in 0..120 {
+        let status = unsafe { manager.authorizationStatus() };
+        if status != CLAuthorizationStatus::NotDetermined {
+            tracing::debug!(?status, "location authorization resolved");
+            return;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    tracing::debug!("location authorization still pending; continuing Wi-Fi setup");
+}
+
+fn run_wifi_provision_prompt() -> Result<Option<WifiProvisionRequest>> {
+    let current_network = current_wifi_network();
+    if let Some(network) = current_network.as_ref() {
+        if let Some(password) = current_keychain_wifi_password(network) {
+            return prompt_current_wifi_provision(&network.ssid, password);
+        }
+
+        return prompt_current_wifi_password_provision(&network.ssid);
+    }
+
+    prompt_manual_wifi_provision(
+        "Could not read the current Wi-Fi network from macOS. Enter the Wi-Fi network name for the M5StickS3:",
+        "",
+    )
+}
+
+fn prompt_current_wifi_provision(
+    ssid: &str,
+    password: String,
+) -> Result<Option<WifiProvisionRequest>> {
+    let script = format!(
+        "set codeResult to text returned of (display dialog {code_message} with title {title} default answer \"\")\nreturn codeResult",
+        code_message = applescript_string(&format!(
+            "Share this Mac's current Wi-Fi network ({ssid}) with the M5StickS3.\n\nPut the Stick in setup mode, then enter the large 8-digit code shown on its screen:"
+        )),
+        title = applescript_string("m5mic Bluetooth Wi-Fi Setup"),
+    );
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .context("run Bluetooth Wi-Fi setup prompt")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("User canceled") {
+            return Ok(None);
+        }
+        let message = stderr.trim();
+        if message.is_empty() {
+            anyhow::bail!("osascript exited with {}", output.status);
+        }
+        anyhow::bail!("{message}");
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("decode Wi-Fi setup prompt output")?;
+    let setup_code = stdout.trim().to_string();
+    Ok(Some(WifiProvisionRequest {
+        ssid: ssid.to_string(),
+        password,
+        setup_code,
+    }))
+}
+
+fn prompt_current_wifi_password_provision(ssid: &str) -> Result<Option<WifiProvisionRequest>> {
+    let script = format!(
+        "set passResult to text returned of (display dialog {password_message} with title {title} default answer \"\" with hidden answer)\nset codeResult to text returned of (display dialog {code_message} with title {title} default answer \"\")\nreturn passResult & linefeed & codeResult",
+        password_message = applescript_string(&format!(
+            "Could not read the Wi-Fi password for {ssid} from Keychain.\n\nEnter the password to send this network to the M5StickS3:"
+        )),
+        code_message = applescript_string(
+            "Put the Stick in setup mode, then enter the large 8-digit code shown on its screen:",
+        ),
+        title = applescript_string("m5mic Bluetooth Wi-Fi Setup"),
+    );
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .context("run current Wi-Fi password setup prompt")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("User canceled") || stderr.contains("-128") {
+            return Ok(None);
+        }
+        let message = stderr.trim();
+        if message.is_empty() {
+            anyhow::bail!("osascript exited with {}", output.status);
+        }
+        anyhow::bail!("{message}");
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("decode current Wi-Fi setup output")?;
+    let mut lines = stdout.trim_end_matches('\n').splitn(2, '\n');
+    let password = lines.next().unwrap_or_default().to_string();
+    let setup_code = lines.next().unwrap_or_default().trim().to_string();
+    Ok(Some(WifiProvisionRequest {
+        ssid: ssid.to_string(),
+        password,
+        setup_code,
+    }))
+}
+
+fn prompt_manual_wifi_provision(
+    ssid_message: &str,
+    default_ssid: &str,
+) -> Result<Option<WifiProvisionRequest>> {
+    let script = format!(
+        "set ssidResult to text returned of (display dialog {ssid_message} with title {title} default answer {default_ssid})\nset passResult to text returned of (display dialog {password_message} with title {title} default answer \"\" with hidden answer)\nset codeResult to text returned of (display dialog {code_message} with title {title} default answer \"\")\nreturn ssidResult & linefeed & passResult & linefeed & codeResult",
+        ssid_message = applescript_string(ssid_message),
+        password_message = applescript_string("Wi-Fi password:"),
+        code_message = applescript_string(
+            "Put the Stick in setup mode, then enter the large 8-digit code shown on its screen:",
+        ),
+        title = applescript_string("m5mic Bluetooth Wi-Fi Setup"),
+        default_ssid = applescript_string(default_ssid),
+    );
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .context("run manual Bluetooth Wi-Fi setup prompt")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("User canceled") || stderr.contains("-128") {
+            return Ok(None);
+        }
+        let message = stderr.trim();
+        if message.is_empty() {
+            anyhow::bail!("osascript exited with {}", output.status);
+        }
+        anyhow::bail!("{message}");
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("decode manual Wi-Fi setup output")?;
+    let mut lines = stdout.trim_end_matches('\n').splitn(3, '\n');
+    let ssid = lines.next().unwrap_or_default().trim().to_string();
+    let password = lines.next().unwrap_or_default().to_string();
+    let setup_code = lines.next().unwrap_or_default().trim().to_string();
+    if ssid.is_empty() {
+        anyhow::bail!("Wi-Fi name is required");
+    }
+    Ok(Some(WifiProvisionRequest {
+        ssid,
+        password,
+        setup_code,
+    }))
+}
+
+fn current_wifi_network() -> Option<WifiNetwork> {
+    current_wifi_network_corewlan()
+        .or_else(|| current_wifi_ssid_system_profiler().map(WifiNetwork::named))
+        .or_else(|| current_wifi_ssid_networksetup().map(WifiNetwork::named))
+}
+
+fn current_wifi_network_corewlan() -> Option<WifiNetwork> {
+    let client = unsafe { objc2_core_wlan::CWWiFiClient::sharedWiFiClient() };
+    let interface = unsafe { client.interface()? };
+    let ssid = unsafe { interface.ssid()? };
+    let ssid = clean_wifi_ssid(&ssid.to_string())?;
+    let ssid_bytes = unsafe { interface.ssidData() }.map(|data| data.to_vec());
+    Some(WifiNetwork { ssid, ssid_bytes })
+}
+
+fn current_wifi_ssid_system_profiler() -> Option<String> {
+    let output = Command::new("/usr/sbin/system_profiler")
+        .args(["SPAirPortDataType", "-json"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let ssid = system_profiler_current_ssid(&value)?;
+    clean_wifi_ssid(ssid)
+}
+
+fn system_profiler_current_ssid(value: &Value) -> Option<&str> {
+    match value {
+        Value::Object(map) => {
+            if let Some(current_network) = map
+                .get("spairport_current_network_information")
+                .and_then(Value::as_object)
+            {
+                if let Some(ssid) = current_network.get("_name").and_then(Value::as_str) {
+                    return Some(ssid);
+                }
+            }
+
+            map.values().find_map(system_profiler_current_ssid)
+        }
+        Value::Array(values) => values.iter().find_map(system_profiler_current_ssid),
+        _ => None,
+    }
+}
+
+fn current_wifi_ssid_networksetup() -> Option<String> {
+    let device = wifi_hardware_device().unwrap_or_else(|| "en0".to_string());
+    let output = Command::new("networksetup")
+        .args(["-getairportnetwork", &device])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let ssid = stdout.split_once(": ")?.1.trim();
+    clean_wifi_ssid(ssid)
+}
+
+fn clean_wifi_ssid(ssid: &str) -> Option<String> {
+    let ssid = ssid.trim();
+    if ssid.is_empty()
+        || ssid.eq_ignore_ascii_case("You are not associated with an AirPort network.")
+    {
+        return None;
+    }
+
+    Some(ssid.to_string())
+}
+
+fn current_keychain_wifi_password(network: &WifiNetwork) -> Option<String> {
+    if network.ssid.is_empty() {
+        return None;
+    }
+
+    let _interaction_lock = SecKeychain::disable_user_interaction().ok();
+    current_corewlan_wifi_password(network.ssid_bytes.as_deref())
+        .or_else(|| current_user_keychain_wifi_password(&network.ssid))
+}
+
+fn current_corewlan_wifi_password(ssid_bytes: Option<&[u8]>) -> Option<String> {
+    let ssid_data = NSData::with_bytes(ssid_bytes?);
+
+    let mut password_ptr: *mut NSString = ptr::null_mut();
+    let status = unsafe {
+        CWKeychainFindWiFiPassword(CWKeychainDomain::User, &ssid_data, &mut password_ptr)
+    };
+    if status == 0 && !password_ptr.is_null() {
+        let password: Retained<NSString> = unsafe { Retained::from_raw(password_ptr)? };
+        return Some(password.to_string());
+    }
+
+    tracing::debug!(
+        status,
+        "CoreWLAN user Wi-Fi password lookup did not return a password"
+    );
+
+    None
+}
+
+fn current_user_keychain_wifi_password(ssid: &str) -> Option<String> {
+    let keychain = user_login_keychain()?;
+    let mut search = ItemSearchOptions::new();
+    search
+        .class(ItemClass::generic_password())
+        .service("AirPort")
+        .account(ssid)
+        .keychains(&[keychain])
+        .load_data(true)
+        .limit(1);
+
+    search
+        .search()
+        .ok()?
+        .into_iter()
+        .find_map(|result| match result {
+            SearchResult::Data(bytes) => password_from_bytes(bytes),
+            _ => None,
+        })
+}
+
+fn user_login_keychain() -> Option<SecKeychain> {
+    let home = env::var_os("HOME")?;
+    for name in ["login.keychain-db", "login.keychain"] {
+        let path = PathBuf::from(&home)
+            .join("Library")
+            .join("Keychains")
+            .join(name);
+        if path.exists() {
+            if let Ok(keychain) = SecKeychain::open(&path) {
+                return Some(keychain);
+            }
+        }
+    }
+
+    None
+}
+
+fn password_from_bytes(bytes: Vec<u8>) -> Option<String> {
+    String::from_utf8(bytes)
+        .ok()
+        .map(|password| password.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn wifi_hardware_device() -> Option<String> {
+    let output = Command::new("networksetup")
+        .arg("-listallhardwareports")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut in_wifi_section = false;
+    for line in stdout.lines() {
+        if let Some(port) = line.strip_prefix("Hardware Port: ") {
+            in_wifi_section = port == "Wi-Fi" || port == "AirPort";
+            continue;
+        }
+        if in_wifi_section {
+            if let Some(device) = line.strip_prefix("Device: ") {
+                return Some(device.trim().to_string());
+            }
+        }
+    }
+
+    None
+}
+
 fn run_driver_install_prompt() -> Result<bool> {
     let source = bundled_driver_path().context("bundled m5mic.driver was not found")?;
     let destination = installed_driver_path();
@@ -640,7 +1078,7 @@ fn sync_usb_mode_item(
     }
 
     let result = if should_show {
-        menu.insert(usb_mode_item, 7)
+        menu.insert(usb_mode_item, 8)
     } else {
         menu.remove(usb_mode_item)
     };
