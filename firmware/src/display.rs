@@ -56,6 +56,12 @@ pub enum RecordModeView {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportView {
+    Wifi,
+    Bluetooth,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Brightness {
     Full,
     Dim,
@@ -138,7 +144,7 @@ impl<'d> StickDisplay<'d> {
     }
 
     pub fn show_wifi_connecting(&mut self) -> Result<()> {
-        self.base(false, false)?;
+        self.base_wifi_with_net(AMBER, false)?;
         self.draw_centered("JOINING", 56, 2, AMBER)?;
         self.draw_centered("WIFI", 88, 3, TEXT)?;
         self.draw_progress(132, AMBER, 18)?;
@@ -147,7 +153,7 @@ impl<'d> StickDisplay<'d> {
     }
 
     pub fn show_ready(&mut self) -> Result<()> {
-        self.base(true, false)?;
+        self.base_wifi(false)?;
         self.draw_record_target(false)?;
         self.draw_centered("TAP", 139, 3, TEXT)?;
         self.draw_centered("START", 168, 2, RED)?;
@@ -162,12 +168,24 @@ impl<'d> StickDisplay<'d> {
         self.draw_centered("B WIFI", 223, 1, MUTED)
     }
 
-    pub fn show_finding_receiver(&mut self) -> Result<()> {
-        self.show_finding_receiver_phase(0)
+    pub fn show_bluetooth_ready(&mut self) -> Result<()> {
+        self.base_bluetooth(false)?;
+        self.draw_record_target(false)?;
+        self.draw_centered("TAP", 139, 3, TEXT)?;
+        self.draw_centered("START", 168, 2, RED)?;
+        self.draw_centered("HOLD B SETUP", 219, 1, MUTED)
     }
 
-    pub fn show_finding_receiver_phase(&mut self, phase: usize) -> Result<()> {
-        self.base(true, false)?;
+    pub fn show_finding_receiver(&mut self, transport: TransportView) -> Result<()> {
+        self.show_finding_receiver_phase(transport, 0)
+    }
+
+    pub fn show_finding_receiver_phase(
+        &mut self,
+        transport: TransportView,
+        phase: usize,
+    ) -> Result<()> {
+        self.base_transport(transport, false)?;
         self.draw_centered("FINDING", 56, 2, AMBER)?;
         self.draw_centered("RECEIVER", 88, 2, TEXT)?;
         self.draw_progress(132, AMBER, progress_phase(phase))?;
@@ -175,17 +193,26 @@ impl<'d> StickDisplay<'d> {
         self.draw_centered("WAIT", 221, 1, MUTED)
     }
 
-    pub fn show_setup_portal(&mut self, ssid: &str) -> Result<()> {
-        self.base(false, false)?;
-        self.draw_centered("SETUP", 55, 2, CYAN)?;
-        self.draw_centered("JOIN WIFI", 91, 2, TEXT)?;
-        self.draw_divider(124, CYAN)?;
-        self.draw_centered(ssid, 151, 1, AMBER)?;
-        self.draw_centered("192.168.71.1", 221, 1, MUTED)
+    pub fn show_setup_portal(&mut self, ssid: &str, setup_code: Option<u32>) -> Result<()> {
+        self.base_setup(false)?;
+        if let Some(setup_code) = setup_code {
+            self.draw_centered("BT SETUP", 47, 2, CYAN)?;
+            self.draw_setup_code_large(setup_code, 76)?;
+            self.draw_divider(145, CYAN)?;
+            self.draw_centered("OR JOIN AP", 156, 1, MUTED)?;
+            self.draw_centered(ssid, 173, 1, AMBER)?;
+            self.draw_centered("192.168.71.1", 221, 1, MUTED)
+        } else {
+            self.draw_centered("SETUP", 55, 2, CYAN)?;
+            self.draw_centered("JOIN WIFI", 91, 2, TEXT)?;
+            self.draw_divider(124, CYAN)?;
+            self.draw_centered(ssid, 151, 1, AMBER)?;
+            self.draw_centered("192.168.71.1", 221, 1, MUTED)
+        }
     }
 
     pub fn show_setup_saved(&mut self) -> Result<()> {
-        self.base_with_net(GREEN, false)?;
+        self.base_wifi_with_net(GREEN, false)?;
         self.draw_centered("OK", 58, 3, GREEN)?;
         self.draw_divider(105, GREEN)?;
         self.draw_centered("WIFI", 139, 2, TEXT)?;
@@ -194,7 +221,7 @@ impl<'d> StickDisplay<'d> {
     }
 
     pub fn show_setup_rebooting(&mut self) -> Result<()> {
-        self.base_with_net(CYAN, false)?;
+        self.base_setup(false)?;
         self.draw_centered("OK", 58, 3, CYAN)?;
         self.draw_divider(105, CYAN)?;
         self.draw_centered("MIC", 139, 2, TEXT)?;
@@ -204,11 +231,12 @@ impl<'d> StickDisplay<'d> {
 
     pub fn show_recording(
         &mut self,
+        transport: TransportView,
         elapsed_secs: u64,
         mode: RecordModeView,
         live_meters: bool,
     ) -> Result<()> {
-        self.base(true, true)?;
+        self.base_transport(transport, true)?;
         self.draw_record_target(true)?;
         self.draw_elapsed(elapsed_secs)?;
         if live_meters {
@@ -242,7 +270,11 @@ impl<'d> StickDisplay<'d> {
 
     pub fn show_error(&mut self, line1: &str, line2: &str) -> Result<()> {
         let wifi_fail = line1.starts_with("WIFI");
-        self.base(!wifi_fail, false)?;
+        if wifi_fail {
+            self.base_wifi_with_net(AMBER, false)?;
+        } else {
+            self.base_error(false)?;
+        }
         self.draw_centered("!", 58, 3, RED)?;
         self.draw_divider(105, RED)?;
 
@@ -284,17 +316,23 @@ impl<'d> StickDisplay<'d> {
         self.backlight.set_duty(duty).context("set LCD backlight")
     }
 
-    fn base(&mut self, wifi: bool, recording: bool) -> Result<()> {
-        let net_color = if wifi { GREEN } else { AMBER };
-        self.base_with_net(net_color, recording)
+    fn base_transport(&mut self, transport: TransportView, recording: bool) -> Result<()> {
+        match transport {
+            TransportView::Wifi => self.base_wifi(recording),
+            TransportView::Bluetooth => self.base_bluetooth(recording),
+        }
     }
 
-    fn base_with_net(&mut self, net_color: u16, recording: bool) -> Result<()> {
+    fn base_wifi(&mut self, recording: bool) -> Result<()> {
+        self.base_wifi_with_net(GREEN, recording)
+    }
+
+    fn base_wifi_with_net(&mut self, net_color: u16, recording: bool) -> Result<()> {
         self.clear(BLACK)?;
         self.fill_rect(0, 0, WIDTH, HEADER_HEIGHT, PANEL)?;
         self.fill_rect(0, HEADER_HEIGHT, WIDTH, 1, LINE)?;
-        self.draw_text("MIC", 8, 8, 2, TEXT)?;
-        self.draw_network_bars(56, net_color)?;
+        self.draw_text("WIFI", 7, 8, 2, TEXT)?;
+        self.draw_network_bars(64, net_color)?;
         self.draw_battery()?;
         if recording {
             self.fill_rect(0, HEADER_HEIGHT + 1, WIDTH, 2, RED_DARK)?;
@@ -308,6 +346,42 @@ impl<'d> StickDisplay<'d> {
         self.fill_rect(0, HEADER_HEIGHT, WIDTH, 1, LINE)?;
         self.draw_text("USB", 8, 8, 2, TEXT)?;
         self.draw_usb_mark(56, CYAN)?;
+        self.draw_battery()?;
+        if recording {
+            self.fill_rect(0, HEADER_HEIGHT + 1, WIDTH, 2, RED_DARK)?;
+        }
+        Ok(())
+    }
+
+    fn base_bluetooth(&mut self, recording: bool) -> Result<()> {
+        self.clear(BLACK)?;
+        self.fill_rect(0, 0, WIDTH, HEADER_HEIGHT, PANEL)?;
+        self.fill_rect(0, HEADER_HEIGHT, WIDTH, 1, LINE)?;
+        self.draw_text("BT", 8, 5, 3, TEXT)?;
+        self.draw_battery()?;
+        if recording {
+            self.fill_rect(0, HEADER_HEIGHT + 1, WIDTH, 2, RED_DARK)?;
+        }
+        Ok(())
+    }
+
+    fn base_setup(&mut self, recording: bool) -> Result<()> {
+        self.clear(BLACK)?;
+        self.fill_rect(0, 0, WIDTH, HEADER_HEIGHT, PANEL)?;
+        self.fill_rect(0, HEADER_HEIGHT, WIDTH, 1, LINE)?;
+        self.draw_text("SETUP", 7, 8, 2, TEXT)?;
+        self.draw_battery()?;
+        if recording {
+            self.fill_rect(0, HEADER_HEIGHT + 1, WIDTH, 2, RED_DARK)?;
+        }
+        Ok(())
+    }
+
+    fn base_error(&mut self, recording: bool) -> Result<()> {
+        self.clear(BLACK)?;
+        self.fill_rect(0, 0, WIDTH, HEADER_HEIGHT, PANEL)?;
+        self.fill_rect(0, HEADER_HEIGHT, WIDTH, 1, LINE)?;
+        self.draw_text("ERR", 8, 8, 2, RED)?;
         self.draw_battery()?;
         if recording {
             self.fill_rect(0, HEADER_HEIGHT + 1, WIDTH, 2, RED_DARK)?;
@@ -452,6 +526,19 @@ impl<'d> StickDisplay<'d> {
         text[4] = b'0' + (seconds % 10) as u8;
         let text = core::str::from_utf8(&text).unwrap();
         self.draw_centered(text, 123, 4, TEXT)
+    }
+
+    fn draw_setup_code_large(&mut self, setup_code: u32, y: i32) -> Result<()> {
+        let mut digits = *b"00000000";
+        let mut value = setup_code % 100_000_000;
+        for index in (0..digits.len()).rev() {
+            digits[index] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+        let first = core::str::from_utf8(&digits[..4]).unwrap();
+        let second = core::str::from_utf8(&digits[4..]).unwrap();
+        self.draw_centered(first, y, 3, TEXT)?;
+        self.draw_centered(second, y + 31, 3, TEXT)
     }
 
     fn clear(&mut self, color: u16) -> Result<()> {

@@ -1,11 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition, EspNvs};
+use m5mic_protocol::Codec;
 
 const NAMESPACE: &str = "m5mic";
 const KEY_SSID: &str = "wifi_ssid";
 const KEY_PASS: &str = "wifi_pass";
 const KEY_BATTERY_BRIGHTNESS: &str = "bat_bright";
 const KEY_RECORDING_BATTERY_SAVER: &str = "rec_bat_save";
+const KEY_WIRELESS_CODEC: &str = "wifi_codec";
 
 #[derive(Clone)]
 pub struct WifiStore {
@@ -25,9 +27,39 @@ pub enum BatteryBrightness {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WirelessCodec {
+    PcmS16Le,
+    ImaAdpcm4,
+}
+
+impl WirelessCodec {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PcmS16Le => "pcm_s16le",
+            Self::ImaAdpcm4 => "ima_adpcm4",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PcmS16Le => "PCM",
+            Self::ImaAdpcm4 => "ADPCM",
+        }
+    }
+
+    pub const fn protocol_codec(self) -> Codec {
+        match self {
+            Self::PcmS16Le => Codec::PcmS16Le,
+            Self::ImaAdpcm4 => Codec::ImaAdpcm4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AppSettings {
     pub battery_brightness: BatteryBrightness,
     pub recording_battery_saver: bool,
+    pub wireless_codec: WirelessCodec,
 }
 
 impl Default for AppSettings {
@@ -35,6 +67,7 @@ impl Default for AppSettings {
         Self {
             battery_brightness: BatteryBrightness::Dim,
             recording_battery_saver: true,
+            wireless_codec: WirelessCodec::PcmS16Le,
         }
     }
 }
@@ -98,9 +131,19 @@ impl WifiStore {
             Some("0")
         );
 
+        let mut codec_buf = [0u8; 16];
+        let wireless_codec = match nvs
+            .get_str(KEY_WIRELESS_CODEC, &mut codec_buf)
+            .context("read wireless codec setting")?
+        {
+            Some("ima_adpcm4") => WirelessCodec::ImaAdpcm4,
+            _ => WirelessCodec::PcmS16Le,
+        };
+
         Ok(AppSettings {
             battery_brightness,
             recording_battery_saver,
+            wireless_codec,
         })
     }
 
@@ -123,6 +166,8 @@ impl WifiStore {
             },
         )
         .context("save recording battery saver setting")?;
+        nvs.set_str(KEY_WIRELESS_CODEC, settings.wireless_codec.as_str())
+            .context("save wireless codec setting")?;
         Ok(())
     }
 

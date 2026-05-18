@@ -6,12 +6,16 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1.0"
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 embedded-svc = "0.29.0"
 esp-idf-hal = "0.46.2"
 esp-idf-svc = "0.52.1"
 esp-idf-sys = "0.37.2"
+esp32-nimble = "0.12.0"
+hkdf = { version = "0.12", default-features = false }
 log = "0.4"
 m5mic-protocol = { path = "../protocol", default-features = false }
+sha2 = { version = "0.10", default-features = false }
 
 [build-dependencies]
 embuild = "0.33.1"

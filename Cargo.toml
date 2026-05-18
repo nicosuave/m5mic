@@ -6,6 +6,7 @@ members = [
     "virtual-mic",
     "statusbar",
     "coreaudio-driver",
+    "ios-core",
 ]
 default-members = ["protocol", "receiver"]
 resolver = "2"

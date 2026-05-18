@@ -61,6 +61,35 @@ Uninstall the driver:
 scripts/uninstall-coreaudio-driver.sh
 ```
 
+## iOS App
+
+The iOS app lives in `ios/`. It uses SwiftUI for the interface and public iOS frameworks for platform access, with the shared m5mic protocol, Bluetooth frame reassembly, ADPCM decode, level metering, and 16 kHz to 48 kHz monitor conversion in the Rust `m5mic-ios-core` static library.
+
+<p>
+  <img src="docs/images/m5mic-ios-recording.png" alt="m5mic iOS app receiving Bluetooth audio and recording to Files" width="320">
+</p>
+
+It supports:
+
+- Bluetooth LE receive through the custom m5mic GATT service
+- Wi-Fi receive by hosting the same `_m5mic._tcp` WebSocket receiver that the firmware already discovers
+- live audio monitoring through AVFoundation
+- device mode commands for Wi-Fi, Bluetooth, and USB
+
+iOS does not allow third-party apps to install audio drivers or expose a system-wide microphone input. The iOS app therefore receives and monitors m5mic audio inside the app only. Its App Store posture is intentionally conservative: it uses CoreBluetooth, Network.framework, Bonjour, UDP/TCP on the local network, and AVFoundation playback, with `NSBluetoothAlwaysUsageDescription`, `NSLocalNetworkUsageDescription`, and `NSBonjourServices` declared in `ios/M5Mic/Info.plist`.
+
+Build the Rust iOS static library directly:
+
+```sh
+PLATFORM_NAME=iphonesimulator ARCHS=arm64 ios/scripts/build-rust-ios.sh
+```
+
+Build the app from the Xcode workspace when an iOS simulator/device runtime matching the active Xcode install is available:
+
+```sh
+xcodebuildmcp simulator build --workspace-path ios/M5Mic.xcworkspace --scheme M5Mic --simulator-name "iPhone 17 Pro"
+```
+
 ## Maintainer Release
 
 `scripts/release-local.sh` builds a signed release zip containing `m5mic.app` with the driver bundled inside it, plus `m5mic.driver` and install/uninstall scripts for manual repair. It uses a local Developer ID Application certificate and optionally notarizes through a local `notarytool` Keychain profile. No Apple credentials need to go into GitHub.
@@ -125,11 +154,11 @@ lsof -nP -iTCP:47776
 
 In wireless mode, tap BtnA once to start a latched live stream and tap BtnA again to stop. Hold BtnA for push-to-talk; release it to stop. The menu-bar app uses that audio live only; the standalone receiver CLI creates WAV files only when recordings are enabled.
 
-Short-tap BtnB to toggle between wireless mode and USB mic mode. Hold BtnB during boot, or hold BtnB for about two seconds while idle, to start the captive setup portal. In setup mode, tap BtnB to reboot back into mic mode.
+Short-tap BtnB to cycle the active mode: Wi-Fi, Bluetooth, USB, then back to Wi-Fi. The menu-bar app exposes separate mode items for Wi-Fi, Bluetooth, and USB. Hold BtnB during boot, or hold BtnB for about two seconds while idle, to start the captive setup portal. In setup mode, tap BtnB to reboot back into mic mode.
 
-Power settings are configurable from the setup portal. By default, battery mode uses dim screen brightness, and recording on battery pauses the live level/buffer UI to save power. Tap BtnB during battery recording to turn the screen fully off or back on. When external power is connected, it keeps the full recording UI.
+Wireless and power settings are configurable from the setup portal. Wi-Fi and Bluetooth are separate runtime modes, not firmware variants. The Wi-Fi audio codec defaults to `pcm_s16le`; `ima_adpcm4` can be selected there to reduce Wi-Fi audio payload size while the receiver/menu-bar app decodes it back to PCM for the virtual microphone. Bluetooth uses the custom m5mic BLE GATT service and sends `ima_adpcm4` audio fragments. By default, battery mode uses dim screen brightness, and recording on battery pauses the live level/buffer UI to save power. Tap BtnB during battery recording to turn the screen fully off or back on. When external power is connected, it keeps the full recording UI.
 
-Wi-Fi setup is optional. Join the `M5Mic-XXXX` access point and open `http://192.168.71.1` if the captive page does not appear automatically. Saved Wi-Fi credentials and power settings are stored in NVS. Saved Wi-Fi takes priority over the build-time `WIFI_SSID` / `WIFI_PASS` fallback. If Wi-Fi is already saved, the setup page shows the current network and a Reboot to Mic Mode button, so setup mode does not force reconfiguration.
+Wi-Fi setup is optional. Join the `M5Mic-XXXX` access point and open `http://192.168.71.1` if the captive page does not appear automatically. The setup page has one save action for Wi-Fi credentials, Wi-Fi codec, and power settings. Bluetooth does not need OS pairing; switch to it with BtnB or the menu-bar app. The setup screen shows an 8-digit Bluetooth setup code, and the menu-bar app can share the Mac's current Wi-Fi network over an encrypted BLE provisioning write using that code. On macOS, the app reads the current SSID, tries non-interactive user keychain password lookup, and falls back to asking for the password and setup code without making you retype the network name. Saved Wi-Fi takes priority over the build-time `WIFI_SSID` / `WIFI_PASS` fallback.
 
 ## UI Preview
 
@@ -165,6 +194,8 @@ set -a
 set +a
 cargo +esp build --release
 ```
+
+The firmware is not split into codec variants or transport variants. Use BtnB or the menu-bar app to switch between Wi-Fi, Bluetooth, and USB. Use the setup portal only for Wi-Fi credentials, Wi-Fi codec, and power settings; saved settings apply at stream start.
 
 Flash the StickS3:
 
