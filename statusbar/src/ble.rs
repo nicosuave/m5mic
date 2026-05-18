@@ -25,7 +25,7 @@ const PROVISION_KEY_INFO: &[u8] = b"m5mic ble wifi v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BleReceiverStatus {
-    Starting,
+    Disabled,
     Scanning,
     Connecting,
     Connected,
@@ -33,9 +33,20 @@ pub enum BleReceiverStatus {
     Error(String),
 }
 
-pub async fn run(status_tx: watch::Sender<BleReceiverStatus>) {
+pub async fn run(
+    status_tx: watch::Sender<BleReceiverStatus>,
+    mut enabled_rx: watch::Receiver<bool>,
+) {
     loop {
-        if let Err(err) = run_once(&status_tx).await {
+        if !receiver_enabled(&enabled_rx) {
+            let _ = status_tx.send(BleReceiverStatus::Disabled);
+            if enabled_rx.changed().await.is_err() {
+                break;
+            }
+            continue;
+        }
+
+        if let Err(err) = run_once(&status_tx, &mut enabled_rx).await {
             let message = err.to_string();
             tracing::warn!(%message, "Bluetooth receiver failed");
             let _ = status_tx.send(BleReceiverStatus::Error(message));
@@ -44,7 +55,7 @@ pub async fn run(status_tx: watch::Sender<BleReceiverStatus>) {
     }
 }
 
-pub async fn send_mode_command(payload: &'static [u8]) -> Result<()> {
+pub async fn send_control_command(payload: &'static [u8]) -> Result<()> {
     let service_uuid = Uuid::parse_str(BLE_SERVICE_UUID).context("parse BLE service UUID")?;
     let control_uuid =
         Uuid::parse_str(BLE_CONTROL_CHARACTERISTIC_UUID).context("parse BLE control UUID")?;
@@ -52,37 +63,47 @@ pub async fn send_mode_command(payload: &'static [u8]) -> Result<()> {
     let adapter = first_adapter(&manager).await?;
     let peripheral = find_m5mic(&adapter, service_uuid).await?;
 
-    if !peripheral
+    let was_connected = peripheral
         .is_connected()
         .await
-        .context("check Bluetooth connection")?
-    {
+        .context("check Bluetooth connection")?;
+    if !was_connected {
         peripheral
             .connect()
             .await
             .context("connect Bluetooth m5mic")?;
     }
-    peripheral
-        .discover_services()
-        .await
-        .context("discover Bluetooth services")?;
 
-    let control_characteristic = peripheral
-        .characteristics()
-        .into_iter()
-        .find(|characteristic| {
-            characteristic.uuid == control_uuid
-                && (characteristic.properties.contains(CharPropFlags::WRITE)
-                    || characteristic
-                        .properties
-                        .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE))
-        })
-        .ok_or_else(|| anyhow!("m5mic Bluetooth control characteristic not found"))?;
+    let result = async {
+        peripheral
+            .discover_services()
+            .await
+            .context("discover Bluetooth services")?;
 
-    peripheral
-        .write(&control_characteristic, payload, WriteType::WithResponse)
-        .await
-        .context("write Bluetooth mode command")
+        let control_characteristic = peripheral
+            .characteristics()
+            .into_iter()
+            .find(|characteristic| {
+                characteristic.uuid == control_uuid
+                    && (characteristic.properties.contains(CharPropFlags::WRITE)
+                        || characteristic
+                            .properties
+                            .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE))
+            })
+            .ok_or_else(|| anyhow!("m5mic Bluetooth control characteristic not found"))?;
+
+        peripheral
+            .write(&control_characteristic, payload, WriteType::WithResponse)
+            .await
+            .context("write Bluetooth control command")
+    }
+    .await;
+
+    if !was_connected {
+        let _ = peripheral.disconnect().await;
+    }
+
+    result
 }
 
 pub async fn provision_wifi(ssid: &str, password: &str, setup_code: &str) -> Result<()> {
@@ -95,47 +116,60 @@ pub async fn provision_wifi(ssid: &str, password: &str, setup_code: &str) -> Res
     let adapter = first_adapter(&manager).await?;
     let peripheral = find_m5mic(&adapter, service_uuid).await?;
 
-    if !peripheral
+    let was_connected = peripheral
         .is_connected()
         .await
-        .context("check Bluetooth connection")?
-    {
+        .context("check Bluetooth connection")?;
+    if !was_connected {
         peripheral
             .connect()
             .await
             .context("connect Bluetooth m5mic")?;
     }
-    peripheral
-        .discover_services()
-        .await
-        .context("discover Bluetooth services")?;
 
-    let provision_characteristic = peripheral
-        .characteristics()
-        .into_iter()
-        .find(|characteristic| {
-            characteristic.uuid == provision_uuid
-                && characteristic.properties.contains(CharPropFlags::READ)
-                && (characteristic.properties.contains(CharPropFlags::WRITE)
-                    || characteristic
-                        .properties
-                        .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE))
-        })
-        .ok_or_else(|| anyhow!("m5mic Bluetooth provisioning characteristic not found"))?;
+    let result = async {
+        peripheral
+            .discover_services()
+            .await
+            .context("discover Bluetooth services")?;
 
-    let info = peripheral
-        .read(&provision_characteristic)
-        .await
-        .context("read Bluetooth provisioning info")?;
-    let salt = parse_provisioning_info(&info)?;
-    let payload = encrypted_wifi_payload(ssid, password, &code, salt)?;
-    peripheral
-        .write(&provision_characteristic, &payload, WriteType::WithResponse)
-        .await
-        .context("write Bluetooth Wi-Fi provisioning payload")
+        let provision_characteristic = peripheral
+            .characteristics()
+            .into_iter()
+            .find(|characteristic| {
+                characteristic.uuid == provision_uuid
+                    && characteristic.properties.contains(CharPropFlags::READ)
+                    && (characteristic.properties.contains(CharPropFlags::WRITE)
+                        || characteristic
+                            .properties
+                            .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE))
+            })
+            .ok_or_else(|| anyhow!("m5mic Bluetooth provisioning characteristic not found"))?;
+
+        let info = peripheral
+            .read(&provision_characteristic)
+            .await
+            .context("read Bluetooth provisioning info")?;
+        let salt = parse_provisioning_info(&info)?;
+        let payload = encrypted_wifi_payload(ssid, password, &code, salt)?;
+        peripheral
+            .write(&provision_characteristic, &payload, WriteType::WithResponse)
+            .await
+            .context("write Bluetooth Wi-Fi provisioning payload")
+    }
+    .await;
+
+    if !was_connected {
+        let _ = peripheral.disconnect().await;
+    }
+
+    result
 }
 
-async fn run_once(status_tx: &watch::Sender<BleReceiverStatus>) -> Result<()> {
+async fn run_once(
+    status_tx: &watch::Sender<BleReceiverStatus>,
+    enabled_rx: &mut watch::Receiver<bool>,
+) -> Result<()> {
     let service_uuid = Uuid::parse_str(BLE_SERVICE_UUID).context("parse BLE service UUID")?;
     let audio_uuid =
         Uuid::parse_str(BLE_AUDIO_CHARACTERISTIC_UUID).context("parse BLE audio UUID")?;
@@ -143,7 +177,11 @@ async fn run_once(status_tx: &watch::Sender<BleReceiverStatus>) -> Result<()> {
     let adapter = first_adapter(&manager).await?;
 
     let _ = status_tx.send(BleReceiverStatus::Scanning);
-    let peripheral = find_m5mic(&adapter, service_uuid).await?;
+    let Some(peripheral) = find_m5mic_while_enabled(&adapter, service_uuid, enabled_rx).await?
+    else {
+        let _ = status_tx.send(BleReceiverStatus::Disabled);
+        return Ok(());
+    };
     let _ = status_tx.send(BleReceiverStatus::Connecting);
 
     if !peripheral
@@ -160,6 +198,11 @@ async fn run_once(status_tx: &watch::Sender<BleReceiverStatus>) -> Result<()> {
         .discover_services()
         .await
         .context("discover Bluetooth services")?;
+    if !receiver_enabled(enabled_rx) {
+        let _ = peripheral.disconnect().await;
+        let _ = status_tx.send(BleReceiverStatus::Disabled);
+        return Ok(());
+    }
 
     let audio_characteristic = peripheral
         .characteristics()
@@ -185,7 +228,21 @@ async fn run_once(status_tx: &watch::Sender<BleReceiverStatus>) -> Result<()> {
     let mut live_audio = LiveAudioOutput::open_default().context("open live audio output")?;
     let mut reassembler = BleFrameReassembler::default();
 
-    while let Some(notification) = notifications.next().await {
+    loop {
+        let notification = tokio::select! {
+            changed = enabled_rx.changed() => {
+                if changed.is_err() || !receiver_enabled(enabled_rx) {
+                    break;
+                }
+                continue;
+            }
+            notification = notifications.next() => notification,
+        };
+
+        let Some(notification) = notification else {
+            break;
+        };
+
         if notification.uuid != audio_uuid {
             continue;
         }
@@ -212,6 +269,9 @@ async fn run_once(status_tx: &watch::Sender<BleReceiverStatus>) -> Result<()> {
 
     live_audio.set_idle();
     let _ = peripheral.disconnect().await;
+    if !receiver_enabled(enabled_rx) {
+        let _ = status_tx.send(BleReceiverStatus::Disabled);
+    }
     Ok(())
 }
 
@@ -310,6 +370,24 @@ async fn first_adapter(manager: &Manager) -> Result<Adapter> {
 }
 
 async fn find_m5mic(adapter: &Adapter, service_uuid: Uuid) -> Result<Peripheral> {
+    find_m5mic_inner(adapter, service_uuid, None)
+        .await?
+        .ok_or_else(|| anyhow!("Bluetooth m5mic not found"))
+}
+
+async fn find_m5mic_while_enabled(
+    adapter: &Adapter,
+    service_uuid: Uuid,
+    enabled_rx: &mut watch::Receiver<bool>,
+) -> Result<Option<Peripheral>> {
+    find_m5mic_inner(adapter, service_uuid, Some(enabled_rx)).await
+}
+
+async fn find_m5mic_inner(
+    adapter: &Adapter,
+    service_uuid: Uuid,
+    mut enabled_rx: Option<&mut watch::Receiver<bool>>,
+) -> Result<Option<Peripheral>> {
     adapter
         .start_scan(ScanFilter {
             services: vec![service_uuid],
@@ -318,6 +396,14 @@ async fn find_m5mic(adapter: &Adapter, service_uuid: Uuid) -> Result<Peripheral>
         .context("scan for Bluetooth m5mic")?;
 
     for _ in 0..20 {
+        if enabled_rx
+            .as_ref()
+            .map(|rx| !receiver_enabled(rx))
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+
         for peripheral in adapter.peripherals().await.context("list peripherals")? {
             let Some(properties) = peripheral.properties().await.context("read properties")? else {
                 continue;
@@ -329,13 +415,29 @@ async fn find_m5mic(adapter: &Adapter, service_uuid: Uuid) -> Result<Peripheral>
                 .map(|name| name.eq_ignore_ascii_case("m5mic"))
                 .unwrap_or(false);
             if has_service || has_name {
-                return Ok(peripheral);
+                return Ok(Some(peripheral));
             }
         }
-        time::sleep(Duration::from_millis(500)).await;
+
+        if let Some(enabled_rx) = enabled_rx.as_deref_mut() {
+            tokio::select! {
+                changed = enabled_rx.changed() => {
+                    if changed.is_err() || !receiver_enabled(enabled_rx) {
+                        return Ok(None);
+                    }
+                }
+                _ = time::sleep(Duration::from_millis(500)) => {}
+            }
+        } else {
+            time::sleep(Duration::from_millis(500)).await;
+        }
     }
 
-    Err(anyhow!("Bluetooth m5mic not found"))
+    Ok(None)
+}
+
+fn receiver_enabled(enabled_rx: &watch::Receiver<bool>) -> bool {
+    *enabled_rx.borrow()
 }
 
 #[derive(Default)]

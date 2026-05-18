@@ -20,7 +20,7 @@ use futures_util::StreamExt;
 use hound::{SampleFormat, WavSpec, WavWriter};
 use m5mic_protocol::{
     discovery_response_url, AudioFrameHeader, Codec, DISCOVERY_PORT, DISCOVERY_REQUEST,
-    DISCOVERY_RESPONSE_PREFIX, MDNS_TYPE_DOMAIN, WS_PATH, WS_PORT,
+    DISCOVERY_RESPONSE_PREFIX, MDNS_TYPE_DOMAIN, RECEIVER_PRIORITY_DESKTOP, WS_PATH, WS_PORT,
 };
 use m5mic_virtual_mic::VirtualMicWriter;
 use mdns_sd::{DaemonEvent, ServiceDaemon, ServiceInfo};
@@ -518,6 +518,8 @@ fn advertise_mdns(config: &ReceiverConfig) -> Result<ServiceDaemon> {
         ("sample_rate", "16000"),
         ("channels", "1"),
         ("udp_discovery_port", "47777"),
+        ("source", "macos"),
+        ("priority", "10"),
     ];
     let service = ServiceInfo::new(
         MDNS_TYPE_DOMAIN,
@@ -564,7 +566,9 @@ async fn udp_discovery(discovery_port: u16, ws_port: u16) {
         }
 
         let local_ip = local_ip_for(peer).unwrap_or(IpAddr::from([127, 0, 0, 1]));
-        let response = format!("{DISCOVERY_RESPONSE_PREFIX}ws://{local_ip}:{ws_port}{WS_PATH}\n");
+        let response = format!(
+            "{DISCOVERY_RESPONSE_PREFIX}ws://{local_ip}:{ws_port}{WS_PATH} source=macos priority={RECEIVER_PRIORITY_DESKTOP}\n"
+        );
         if let Err(err) = socket.send_to(response.as_bytes(), peer).await {
             warn!(%err, %peer, "udp discovery response failed");
         } else {

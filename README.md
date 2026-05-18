@@ -61,6 +61,35 @@ Uninstall the driver:
 scripts/uninstall-coreaudio-driver.sh
 ```
 
+## iOS App
+
+The iOS app lives in `ios/`. It uses SwiftUI for the interface and public iOS frameworks for platform access, with the shared m5mic protocol, Bluetooth frame reassembly, ADPCM decode, level metering, and 16 kHz to 48 kHz monitor conversion in the Rust `m5mic-ios-core` static library.
+
+<p>
+  <img src="docs/images/m5mic-ios-recording.png" alt="m5mic iOS app receiving Bluetooth audio and recording to Files" width="320">
+</p>
+
+It supports:
+
+- Bluetooth LE receive through the custom m5mic GATT service
+- Wi-Fi receive by hosting the same `_m5mic._tcp` WebSocket receiver that the firmware already discovers
+- live audio monitoring through AVFoundation
+- device mode commands for Wi-Fi, Bluetooth, and USB
+
+iOS does not allow third-party apps to install audio drivers or expose a system-wide microphone input. The iOS app therefore receives and monitors m5mic audio inside the app only. Its App Store posture is intentionally conservative: it uses CoreBluetooth, Network.framework, Bonjour, UDP/TCP on the local network, and AVFoundation playback, with `NSBluetoothAlwaysUsageDescription`, `NSLocalNetworkUsageDescription`, and `NSBonjourServices` declared in `ios/M5Mic/Info.plist`.
+
+Build the Rust iOS static library directly:
+
+```sh
+PLATFORM_NAME=iphonesimulator ARCHS=arm64 ios/scripts/build-rust-ios.sh
+```
+
+Build the app from the Xcode workspace when an iOS simulator/device runtime matching the active Xcode install is available:
+
+```sh
+xcodebuildmcp simulator build --workspace-path ios/M5Mic.xcworkspace --scheme M5Mic --simulator-name "iPhone 17 Pro"
+```
+
 ## Maintainer Release
 
 `scripts/release-local.sh` builds a signed release zip containing `m5mic.app` with the driver bundled inside it, plus `m5mic.driver` and install/uninstall scripts for manual repair. It uses a local Developer ID Application certificate and optionally notarizes through a local `notarytool` Keychain profile. No Apple credentials need to go into GitHub.

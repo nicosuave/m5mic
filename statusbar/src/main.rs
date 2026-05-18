@@ -17,7 +17,8 @@ use clap::Parser;
 use coreaudio_sys::*;
 use if_addrs::{get_if_addrs, IfAddr};
 use m5mic_protocol::{
-    CONTROL_MODE_BLE, CONTROL_MODE_USB, CONTROL_MODE_WIFI, CONTROL_PORT, DISCOVERY_PORT, WS_PORT,
+    CONTROL_MODE_BLE, CONTROL_MODE_USB, CONTROL_MODE_WIFI, CONTROL_PORT, CONTROL_RECORD_START,
+    CONTROL_RECORD_STOP, DISCOVERY_PORT, WS_PORT,
 };
 use m5mic_receiver::{run, ReceiverConfig, ReceiverStatus};
 use objc2::rc::Retained;
@@ -141,6 +142,21 @@ impl InputMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecordingCommand {
+    Start,
+    Stop,
+}
+
+impl RecordingCommand {
+    const fn menu_label(self) -> &'static str {
+        match self {
+            Self::Start => "start recording",
+            Self::Stop => "stop recording",
+        }
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -152,7 +168,8 @@ fn main() -> Result<()> {
     let runtime = Runtime::new().context("start tokio runtime")?;
     let runtime_handle = runtime.handle().clone();
     let (status_tx, status_rx) = watch::channel(ReceiverStatus::Starting);
-    let (ble_status_tx, ble_status_rx) = watch::channel(ble::BleReceiverStatus::Starting);
+    let (ble_status_tx, ble_status_rx) = watch::channel(ble::BleReceiverStatus::Disabled);
+    let (ble_enabled_tx, ble_enabled_rx) = watch::channel(false);
 
     let config = ReceiverConfig {
         listen: args.listen,
@@ -169,7 +186,7 @@ fn main() -> Result<()> {
             let _ = receiver_status_tx.send(ReceiverStatus::Error(err.to_string()));
         }
     });
-    runtime.spawn(ble::run(ble_status_tx));
+    runtime.spawn(ble::run(ble_status_tx, ble_enabled_rx));
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
@@ -247,12 +264,14 @@ fn main() -> Result<()> {
     let install_driver_item =
         MenuItem::with_id("install-driver", "Install Audio Driver...", true, None);
     let usb_status_item = MenuItem::new("USB: checking", false, None);
-    let bluetooth_status_item = MenuItem::new("Bluetooth: starting", false, None);
+    let bluetooth_status_item = MenuItem::new("Bluetooth: off", false, None);
     let provision_wifi_item =
         MenuItem::with_id("provision-wifi", "Send Wi-Fi over Bluetooth...", true, None);
     let wifi_mode_item = MenuItem::with_id("mode-wifi", "Use Wi-Fi Mode", true, None);
     let bluetooth_mode_item = MenuItem::with_id("mode-bluetooth", "Use Bluetooth Mode", true, None);
     let usb_mode_item = MenuItem::with_id("mode-usb", "Use USB Mode", true, None);
+    let start_recording_item = MenuItem::with_id("record-start", "Start Recording", true, None);
+    let stop_recording_item = MenuItem::with_id("record-stop", "Stop Recording", true, None);
     let settings_item = MenuItem::with_id("sound-settings", "Open Sound Settings", true, None);
     let quit_item = MenuItem::with_id("quit", "Quit m5mic", true, None);
     let separator = PredefinedMenuItem::separator();
@@ -278,6 +297,10 @@ fn main() -> Result<()> {
         menu.append(&usb_mode_item)
             .context("add USB mode menu item")?;
     }
+    menu.append(&start_recording_item)
+        .context("add recording start menu item")?;
+    menu.append(&stop_recording_item)
+        .context("add recording stop menu item")?;
     menu.append(&separator).context("add menu separator")?;
     menu.append(&settings_item)
         .context("add sound settings menu item")?;
@@ -285,7 +308,7 @@ fn main() -> Result<()> {
     let menu_handle = menu.clone();
     let mut current_driver_status = initial_driver_status;
     let mut latest_receiver_status = ReceiverStatus::Starting;
-    let mut latest_ble_status = ble::BleReceiverStatus::Starting;
+    let mut latest_ble_status = ble::BleReceiverStatus::Disabled;
     let mut driver_install_running = false;
     let mut driver_install_prompted = false;
     let mut location_manager: Option<Retained<CLLocationManager>> = None;
@@ -406,14 +429,23 @@ fn main() -> Result<()> {
             } else if event.id == MenuId::from("quit") {
                 event_loop.exit();
             } else if event.id == MenuId::from("mode-wifi") {
+                let _ = ble_enabled_tx.send(false);
                 set_menu_input_mode(InputMode::Wifi, &status_item);
                 spawn_ble_mode_command(&runtime_handle, InputMode::Wifi);
             } else if event.id == MenuId::from("mode-bluetooth") {
+                let _ = ble_enabled_tx.send(true);
                 set_menu_input_mode(InputMode::Bluetooth, &status_item);
                 spawn_ble_mode_command(&runtime_handle, InputMode::Bluetooth);
             } else if event.id == MenuId::from("mode-usb") {
+                let _ = ble_enabled_tx.send(false);
                 set_menu_input_mode(InputMode::Usb, &status_item);
                 spawn_ble_mode_command(&runtime_handle, InputMode::Usb);
+            } else if event.id == MenuId::from("record-start") {
+                set_menu_recording_command(RecordingCommand::Start, &status_item);
+                spawn_ble_recording_command(&runtime_handle, RecordingCommand::Start);
+            } else if event.id == MenuId::from("record-stop") {
+                set_menu_recording_command(RecordingCommand::Stop, &status_item);
+                spawn_ble_recording_command(&runtime_handle, RecordingCommand::Stop);
             } else if event.id == MenuId::from("provision-wifi") {
                 status_item.set_text("Status: setting up Wi-Fi over Bluetooth");
                 let wait_for_location =
@@ -456,7 +488,7 @@ fn status_text(status: &ReceiverStatus) -> String {
 
 fn bluetooth_status_text(status: &ble::BleReceiverStatus) -> String {
     match status {
-        ble::BleReceiverStatus::Starting => "starting".to_string(),
+        ble::BleReceiverStatus::Disabled => "off".to_string(),
         ble::BleReceiverStatus::Scanning => "scanning".to_string(),
         ble::BleReceiverStatus::Connecting => "connecting".to_string(),
         ble::BleReceiverStatus::Connected => "connected".to_string(),
@@ -1099,6 +1131,16 @@ fn set_menu_input_mode(mode: InputMode, status_item: &MenuItem) {
     }
 }
 
+fn set_menu_recording_command(command: RecordingCommand, status_item: &MenuItem) {
+    match send_recording_command(command) {
+        Ok(()) => status_item.set_text(format!("Status: {} sent", command.menu_label())),
+        Err(err) => {
+            tracing::warn!(?err, ?command, "failed to send recording command");
+            status_item.set_text(format!("Status: {} failed", command.menu_label()));
+        }
+    }
+}
+
 fn switch_input_mode(mode: InputMode) -> Result<()> {
     let input_device = find_m5mic_input(mode)?;
     set_default_input_device(input_device).context("set default input device")?;
@@ -1147,8 +1189,16 @@ fn send_device_mode(mode: InputMode) -> Result<()> {
         InputMode::Bluetooth => CONTROL_MODE_BLE,
         InputMode::Usb => CONTROL_MODE_USB,
     };
+    send_control_payload(payload, "mode")
+}
+
+fn send_recording_command(command: RecordingCommand) -> Result<()> {
+    send_control_payload(recording_command_payload(command), "recording")
+}
+
+fn send_control_payload(payload: &'static [u8], label: &str) -> Result<()> {
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
-        .context("bind mode control socket")?;
+        .context("bind control socket")?;
     socket.set_broadcast(true).context("enable broadcast")?;
 
     let targets = mode_control_targets();
@@ -1156,7 +1206,7 @@ fn send_device_mode(mode: InputMode) -> Result<()> {
         for target in &targets {
             socket
                 .send_to(payload, target)
-                .with_context(|| format!("send mode control packet to {target}"))?;
+                .with_context(|| format!("send {label} control packet to {target}"))?;
         }
         thread::sleep(Duration::from_millis(75));
     }
@@ -1171,10 +1221,26 @@ fn spawn_ble_mode_command(runtime: &Handle, mode: InputMode) {
         InputMode::Usb => CONTROL_MODE_USB,
     };
     runtime.spawn(async move {
-        if let Err(err) = ble::send_mode_command(payload).await {
+        if let Err(err) = ble::send_control_command(payload).await {
             tracing::debug!(?err, ?mode, "Bluetooth mode command failed");
         }
     });
+}
+
+fn spawn_ble_recording_command(runtime: &Handle, command: RecordingCommand) {
+    let payload = recording_command_payload(command);
+    runtime.spawn(async move {
+        if let Err(err) = ble::send_control_command(payload).await {
+            tracing::debug!(?err, ?command, "Bluetooth recording command failed");
+        }
+    });
+}
+
+const fn recording_command_payload(command: RecordingCommand) -> &'static [u8] {
+    match command {
+        RecordingCommand::Start => CONTROL_RECORD_START,
+        RecordingCommand::Stop => CONTROL_RECORD_STOP,
+    }
 }
 
 fn mode_control_targets() -> Vec<SocketAddrV4> {

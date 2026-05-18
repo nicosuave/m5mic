@@ -44,8 +44,8 @@ use esp_idf_svc::{
 };
 use log::{info, warn};
 use m5mic_protocol::{
-    ima_adpcm4_encode, ima_adpcm4_encoded_len, AudioFrameHeader, Codec, ImaAdpcmState,
-    CONTROL_MODE_BLE, CONTROL_MODE_USB, CONTROL_MODE_WIFI, CONTROL_MODE_WIRELESS, CONTROL_PORT,
+    ima_adpcm4_encode, ima_adpcm4_encoded_len, parse_control_command, AudioFrameHeader, Codec,
+    ControlAction, ControlMode, ImaAdpcmState, CONTROL_PORT, CONTROL_PRIORITY_PHONE,
     FLAG_PUSH_TO_TALK, FLAG_STREAM_END, FLAG_STREAM_START, HEADER_LEN,
 };
 use usb_audio::TransportMode;
@@ -67,13 +67,14 @@ const SETUP_BOOT_HOLD_MS: u32 = 1_200;
 const SETUP_IDLE_HOLD_MS: u32 = 2_000;
 const PUSH_TO_TALK_HOLD_MS: u32 = 450;
 const CAPTURE_THREAD_STACK: usize = 12_288;
+const CONTROL_LEASE_US: u64 = 30_000_000;
 
 #[derive(Debug, Eq, PartialEq)]
 enum IdleAction {
-    Record(RecordMode),
+    Record { mode: RecordMode, priority: u8 },
     Setup,
     CycleMode,
-    SetMode(ActiveMode),
+    SetMode(ModeCommand),
     ProvisionWifi(ble::ProvisionedWifi),
 }
 
@@ -89,9 +90,17 @@ enum RecordMode {
     PushToTalk,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ModeCommand {
+    mode: ActiveMode,
+    priority: u8,
+}
+
 #[derive(Debug, Eq, PartialEq)]
-enum ModeCommand {
-    SetMode(ActiveMode),
+enum ControlEvent {
+    SetMode(ModeCommand),
+    RecordStart { priority: u8 },
+    RecordStop,
     ProvisionWifi(ble::ProvisionedWifi),
 }
 
@@ -103,6 +112,14 @@ enum ActiveMode {
 }
 
 impl ActiveMode {
+    const fn from_control(mode: ControlMode) -> Self {
+        match mode {
+            ControlMode::Usb => Self::Usb,
+            ControlMode::Wifi => Self::Wifi,
+            ControlMode::Bluetooth => Self::Bluetooth,
+        }
+    }
+
     const fn next(self) -> Self {
         match self {
             Self::Wifi => Self::Bluetooth,
@@ -117,6 +134,26 @@ impl ActiveMode {
             Self::Bluetooth => "Bluetooth",
             Self::Usb => "USB",
         }
+    }
+}
+
+#[derive(Default)]
+struct ControlLease {
+    priority: u8,
+    expires_us: u64,
+}
+
+impl ControlLease {
+    fn accepts(&mut self, command: ModeCommand, now_us: u64) -> bool {
+        if now_us >= self.expires_us {
+            self.priority = 0;
+        }
+        if command.priority < self.priority {
+            return false;
+        }
+        self.priority = command.priority;
+        self.expires_us = now_us.saturating_add(CONTROL_LEASE_US);
+        true
     }
 }
 
@@ -275,6 +312,7 @@ fn main() -> Result<()> {
     let mut ble_audio = None;
     let mut cached_receiver = None;
     let mut active_mode = ActiveMode::Wifi;
+    let mut control_lease = ControlLease::default();
     activate_mode(
         active_mode,
         &mut wifi,
@@ -296,6 +334,7 @@ fn main() -> Result<()> {
                 &usb_audio,
                 &control_socket,
                 ble_audio.as_ref(),
+                &mut control_lease,
             )
             .context("wait for USB mode action")?,
             ActiveMode::Wifi | ActiveMode::Bluetooth => wait_for_idle_action(
@@ -305,12 +344,18 @@ fn main() -> Result<()> {
                 &mut pm1_i2c,
                 &control_socket,
                 ble_audio.as_ref(),
+                &mut control_lease,
             )
             .context("wait for idle action")?,
         };
 
         let mode = match action {
-            IdleAction::Record(mode) => mode,
+            IdleAction::Record { mode, priority } => {
+                if active_mode == ActiveMode::Wifi && priority >= CONTROL_PRIORITY_PHONE {
+                    cached_receiver = None;
+                }
+                mode
+            }
             IdleAction::CycleMode => {
                 active_mode = active_mode.next();
                 activate_mode(
@@ -327,8 +372,15 @@ fn main() -> Result<()> {
                 info!("mode switched to {}", active_mode.label());
                 continue;
             }
-            IdleAction::SetMode(next) => {
-                active_mode = next;
+            IdleAction::SetMode(command) => {
+                if command.priority >= CONTROL_PRIORITY_PHONE && command.mode == ActiveMode::Wifi {
+                    cached_receiver = None;
+                }
+                if command.mode == active_mode {
+                    info!("mode already {}", active_mode.label());
+                    continue;
+                }
+                active_mode = command.mode;
                 activate_mode(
                     active_mode,
                     &mut wifi,
@@ -420,6 +472,9 @@ fn main() -> Result<()> {
                     &mut pm1_i2c,
                     &app_settings,
                     mode,
+                    &control_socket,
+                    ble_audio.as_ref(),
+                    &mut control_lease,
                 )
             }),
             ActiveMode::Bluetooth => ensure_ble_audio(&mut ble_audio).and_then(|ble_audio| {
@@ -432,6 +487,8 @@ fn main() -> Result<()> {
                     &mut pm1_i2c,
                     &app_settings,
                     mode,
+                    &control_socket,
+                    &mut control_lease,
                 )
             }),
             ActiveMode::Usb => Ok(()),
@@ -462,21 +519,20 @@ fn main() -> Result<()> {
                 display
                     .show_error("STREAM", "CHECK SERVER")
                     .context("draw stream error")?;
+                FreeRtos::delay_ms(750);
+                activate_mode(
+                    active_mode,
+                    &mut wifi,
+                    &wifi_store,
+                    &mut mdns,
+                    &mut ble_audio,
+                    &mut display,
+                    &mut pm1_i2c,
+                    &usb_audio,
+                    &app_settings,
+                )?;
             }
         }
-
-        FreeRtos::delay_ms(750);
-        activate_mode(
-            active_mode,
-            &mut wifi,
-            &wifi_store,
-            &mut mdns,
-            &mut ble_audio,
-            &mut display,
-            &mut pm1_i2c,
-            &usb_audio,
-            &app_settings,
-        )?;
         info!("press BtnA to start recording");
     }
 }
@@ -528,53 +584,114 @@ fn create_control_socket() -> Result<UdpSocket> {
     Ok(socket)
 }
 
-fn poll_transport_control(socket: &UdpSocket) -> Result<Option<ModeCommand>> {
-    let mut buf = [0u8; 64];
-    let mut requested = None;
+#[derive(Default)]
+struct PolledControl {
+    mode: Option<ModeCommand>,
+    record_start_priority: Option<u8>,
+    record_stop: bool,
+}
+
+fn poll_transport_control(socket: &UdpSocket) -> Result<PolledControl> {
+    let mut buf = [0u8; 128];
+    let mut requested = PolledControl::default();
 
     loop {
         match socket.recv_from(&mut buf) {
             Ok((len, addr)) => {
                 let payload = &buf[..len];
-                if payload == CONTROL_MODE_USB {
-                    info!("mode command from {addr}: USB");
-                    requested = Some(ModeCommand::SetMode(ActiveMode::Usb));
-                } else if payload == CONTROL_MODE_WIRELESS || payload == CONTROL_MODE_WIFI {
-                    info!("mode command from {addr}: Wi-Fi");
-                    requested = Some(ModeCommand::SetMode(ActiveMode::Wifi));
-                } else if payload == CONTROL_MODE_BLE {
-                    info!("mode command from {addr}: Bluetooth");
-                    requested = Some(ModeCommand::SetMode(ActiveMode::Bluetooth));
+                if let Some(command) = parse_control_command(payload) {
+                    merge_control_command(&mut requested, command.action, command.priority);
+                    info!(
+                        "control command from {addr}: {:?} priority {}",
+                        command.action, command.priority
+                    );
                 } else {
-                    warn!("unknown mode command from {addr}");
+                    warn!("unknown control command from {addr}");
                 }
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => return Ok(requested),
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err).context("receive mode control"),
+            Err(err) => return Err(err).context("receive control command"),
         }
     }
 }
 
-fn poll_mode_control(
+fn poll_control(
     socket: &UdpSocket,
     ble_audio: Option<&ble::BleAudioServer>,
-) -> Result<Option<ModeCommand>> {
-    if let Some(command) = poll_transport_control(socket)? {
-        return Ok(Some(command));
-    }
+) -> Result<PolledControl> {
+    let mut requested = poll_transport_control(socket)?;
 
     let Some(ble_audio) = ble_audio else {
-        return Ok(None);
+        return Ok(requested);
     };
-    if let Some(credentials) = ble_audio.take_provisioned_wifi() {
-        return Ok(Some(ModeCommand::ProvisionWifi(credentials)));
+    if let Some(command) = ble_audio.take_control_command() {
+        merge_control_command(&mut requested, command.action, command.priority);
     }
-    Ok(ble_audio.take_mode_command().map(|command| match command {
-        ble::BleModeCommand::Usb => ModeCommand::SetMode(ActiveMode::Usb),
-        ble::BleModeCommand::Wifi => ModeCommand::SetMode(ActiveMode::Wifi),
-        ble::BleModeCommand::Bluetooth => ModeCommand::SetMode(ActiveMode::Bluetooth),
-    }))
+    Ok(requested)
+}
+
+fn merge_control_command(requested: &mut PolledControl, action: ControlAction, priority: u8) {
+    match action {
+        ControlAction::SetMode(mode) => {
+            let command = ModeCommand {
+                mode: ActiveMode::from_control(mode),
+                priority,
+            };
+            requested.mode = best_mode_command(requested.mode, command);
+        }
+        ControlAction::RecordStart => {
+            requested.record_start_priority =
+                Some(requested.record_start_priority.unwrap_or(0).max(priority));
+        }
+        ControlAction::RecordStop => requested.record_stop = true,
+    }
+}
+
+fn best_mode_command(current: Option<ModeCommand>, next: ModeCommand) -> Option<ModeCommand> {
+    if current
+        .map(|current| next.priority >= current.priority)
+        .unwrap_or(true)
+    {
+        Some(next)
+    } else {
+        current
+    }
+}
+
+fn poll_accepted_control_event(
+    socket: &UdpSocket,
+    ble_audio: Option<&ble::BleAudioServer>,
+    control_lease: &mut ControlLease,
+) -> Result<Option<ControlEvent>> {
+    if let Some(ble_audio) = ble_audio {
+        if let Some(credentials) = ble_audio.take_provisioned_wifi() {
+            return Ok(Some(ControlEvent::ProvisionWifi(credentials)));
+        }
+    }
+
+    let requested = poll_control(socket, ble_audio)?;
+    if requested.record_stop {
+        return Ok(Some(ControlEvent::RecordStop));
+    }
+
+    if let Some(command) = requested.mode {
+        let now_us = esp_timer_us();
+        if control_lease.accepts(command, now_us) {
+            return Ok(Some(ControlEvent::SetMode(command)));
+        }
+        info!(
+            "ignored lower-priority mode command: {} priority {}",
+            command.mode.label(),
+            command.priority
+        );
+    }
+
+    if let Some(priority) = requested.record_start_priority {
+        return Ok(Some(ControlEvent::RecordStart { priority }));
+    }
+
+    Ok(None)
 }
 
 fn connect_wifi(
@@ -717,6 +834,9 @@ fn record_once_wifi(
     pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
     settings: &AppSettings,
     mode: RecordMode,
+    control_socket: &UdpSocket,
+    ble_audio: Option<&ble::BleAudioServer>,
+    control_lease: &mut ControlLease,
 ) -> Result<()> {
     if let Some(server_url) = cached_receiver.clone() {
         info!("using cached receiver: {server_url}");
@@ -724,7 +844,17 @@ fn record_once_wifi(
             Ok(client) => {
                 info!("recording started; press BtnA to stop");
                 let result = stream_audio_connected(
-                    client, audio, button_a, button_b, display, pm1_i2c, settings, mode,
+                    client,
+                    audio,
+                    button_a,
+                    button_b,
+                    display,
+                    pm1_i2c,
+                    settings,
+                    mode,
+                    control_socket,
+                    ble_audio,
+                    control_lease,
                 );
                 if result.is_err() {
                     *cached_receiver = None;
@@ -753,7 +883,17 @@ fn record_once_wifi(
 
     info!("recording started; press BtnA to stop");
     let result = stream_audio_connected(
-        client, audio, button_a, button_b, display, pm1_i2c, settings, mode,
+        client,
+        audio,
+        button_a,
+        button_b,
+        display,
+        pm1_i2c,
+        settings,
+        mode,
+        control_socket,
+        ble_audio,
+        control_lease,
     );
     if result.is_err() {
         *cached_receiver = None;
@@ -770,6 +910,8 @@ fn record_once_ble(
     pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
     settings: &AppSettings,
     mode: RecordMode,
+    control_socket: &UdpSocket,
+    control_lease: &mut ControlLease,
 ) -> Result<()> {
     display
         .show_finding_receiver(display::TransportView::Bluetooth)
@@ -779,10 +921,25 @@ fn record_once_ble(
             info!("Bluetooth receiver connected");
             ble_audio.set_status(b"connected");
             return stream_audio_ble(
-                ble_audio, audio, button_a, button_b, display, pm1_i2c, settings, mode,
+                ble_audio,
+                audio,
+                button_a,
+                button_b,
+                display,
+                pm1_i2c,
+                settings,
+                mode,
+                control_socket,
+                control_lease,
             );
         }
-        if should_stop_stream(mode, button_a) {
+        if should_stop_stream(
+            mode,
+            button_a,
+            control_socket,
+            Some(ble_audio),
+            control_lease,
+        )? {
             return Ok(());
         }
         if let Err(err) =
@@ -846,6 +1003,9 @@ fn stream_audio_connected(
     pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
     settings: &AppSettings,
     mode: RecordMode,
+    control_socket: &UdpSocket,
+    ble_audio: Option<&ble::BleAudioServer>,
+    control_lease: &mut ControlLease,
 ) -> Result<()> {
     drain_i2s(audio, DRAIN_FRAMES).context("drain pre-stream audio")?;
     refresh_battery(pm1_i2c, display).context("draw battery")?;
@@ -912,6 +1072,9 @@ fn stream_audio_connected(
             settings,
             &mut last_sequence,
             &mut have_sent_audio,
+            control_socket,
+            ble_audio,
+            control_lease,
         );
 
         stop_capture.store(true, Ordering::Relaxed);
@@ -935,14 +1098,15 @@ fn stream_audio_connected(
     })?;
 
     if have_sent_audio && client.is_connected() {
-        send_stream_end(
+        if let Err(err) = send_stream_end(
             &mut client,
             stream_id,
             last_sequence.wrapping_add(1),
             mode,
             wireless_codec,
-        )
-        .context("send stream end")?;
+        ) {
+            warn!("failed to send stream end: {err:#}");
+        }
     }
 
     match stop_reason {
@@ -960,6 +1124,8 @@ fn stream_audio_ble(
     pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
     settings: &AppSettings,
     mode: RecordMode,
+    control_socket: &UdpSocket,
+    control_lease: &mut ControlLease,
 ) -> Result<()> {
     drain_i2s(audio, DRAIN_FRAMES).context("drain pre-stream audio")?;
     refresh_battery(pm1_i2c, display).context("draw battery")?;
@@ -1028,6 +1194,9 @@ fn stream_audio_ble(
             settings,
             &mut last_sequence,
             &mut have_sent_audio,
+            control_socket,
+            Some(ble_audio),
+            control_lease,
         );
 
         stop_capture.store(true, Ordering::Relaxed);
@@ -1151,6 +1320,9 @@ fn send_captured_audio(
     settings: &AppSettings,
     last_sequence: &mut u32,
     have_sent_audio: &mut bool,
+    control_socket: &UdpSocket,
+    ble_audio: Option<&ble::BleAudioServer>,
+    control_lease: &mut ControlLease,
 ) -> Result<StreamStop> {
     let started_us = esp_timer_us();
     let mut last_elapsed_secs = 0;
@@ -1161,7 +1333,7 @@ fn send_captured_audio(
     let mut display_off = false;
 
     loop {
-        if should_stop_stream(mode, button_a) {
+        if should_stop_stream(mode, button_a, control_socket, ble_audio, control_lease)? {
             return Ok(StreamStop::User);
         }
         if power_save_recording && consume_button_press(button_b) {
@@ -1298,6 +1470,9 @@ fn send_captured_audio_ble(
     settings: &AppSettings,
     last_sequence: &mut u32,
     have_sent_audio: &mut bool,
+    control_socket: &UdpSocket,
+    control_ble_audio: Option<&ble::BleAudioServer>,
+    control_lease: &mut ControlLease,
 ) -> Result<StreamStop> {
     let started_us = esp_timer_us();
     let mut last_elapsed_secs = 0;
@@ -1308,7 +1483,13 @@ fn send_captured_audio_ble(
     let mut display_off = false;
 
     loop {
-        if should_stop_stream(mode, button_a) {
+        if should_stop_stream(
+            mode,
+            button_a,
+            control_socket,
+            control_ble_audio,
+            control_lease,
+        )? {
             return Ok(StreamStop::User);
         }
         if power_save_recording && consume_button_press(button_b) {
@@ -1429,10 +1610,39 @@ fn send_captured_audio_ble(
     }
 }
 
-fn should_stop_stream(mode: RecordMode, button_a: &PinDriver<Input>) -> bool {
-    match mode {
+fn should_stop_stream(
+    mode: RecordMode,
+    button_a: &PinDriver<Input>,
+    control_socket: &UdpSocket,
+    ble_audio: Option<&ble::BleAudioServer>,
+    control_lease: &mut ControlLease,
+) -> Result<bool> {
+    if match mode {
         RecordMode::Latched => consume_button_press(button_a),
         RecordMode::PushToTalk => !button_a.is_low(),
+    } {
+        return Ok(true);
+    }
+
+    let Some(event) = poll_accepted_control_event(control_socket, ble_audio, control_lease)? else {
+        return Ok(false);
+    };
+
+    match event {
+        ControlEvent::RecordStop => Ok(true),
+        ControlEvent::RecordStart { .. } => Ok(false),
+        ControlEvent::SetMode(command) => {
+            info!(
+                "mode command deferred while recording: {} priority {}",
+                command.mode.label(),
+                command.priority
+            );
+            Ok(false)
+        }
+        ControlEvent::ProvisionWifi(_) => {
+            info!("Wi-Fi provisioning deferred while recording");
+            Ok(false)
+        }
     }
 }
 
@@ -1602,11 +1812,12 @@ fn wait_for_idle_action(
     pm1_i2c: &mut Option<i2c_bus::I2cDevice>,
     control_socket: &UdpSocket,
     ble_audio: Option<&ble::BleAudioServer>,
+    control_lease: &mut ControlLease,
 ) -> Result<IdleAction> {
     let mut next_battery_refresh_us = esp_timer_us().saturating_add(BATTERY_REFRESH_US);
     loop {
         if let Some(mode) = consume_record_request(button_a) {
-            return Ok(IdleAction::Record(mode));
+            return Ok(IdleAction::Record { mode, priority: 0 });
         }
         if let Some(action) = consume_button_b_action(button_b) {
             return Ok(match action {
@@ -1614,13 +1825,17 @@ fn wait_for_idle_action(
                 ButtonBAction::Setup => IdleAction::Setup,
             });
         }
-        if let Some(command) = poll_mode_control(control_socket, ble_audio)? {
-            match command {
-                ModeCommand::SetMode(mode) => return Ok(IdleAction::SetMode(mode)),
-                ModeCommand::ProvisionWifi(credentials) => {
-                    return Ok(IdleAction::ProvisionWifi(credentials));
-                }
-            }
+        if let Some(event) = poll_accepted_control_event(control_socket, ble_audio, control_lease)?
+        {
+            return Ok(match event {
+                ControlEvent::SetMode(command) => IdleAction::SetMode(command),
+                ControlEvent::RecordStart { priority } => IdleAction::Record {
+                    mode: RecordMode::Latched,
+                    priority,
+                },
+                ControlEvent::RecordStop => continue,
+                ControlEvent::ProvisionWifi(credentials) => IdleAction::ProvisionWifi(credentials),
+            });
         }
 
         let now_us = esp_timer_us();
@@ -1640,6 +1855,7 @@ fn wait_for_usb_action(
     audio: &usb_audio::UsbAudio,
     control_socket: &UdpSocket,
     ble_audio: Option<&ble::BleAudioServer>,
+    control_lease: &mut ControlLease,
 ) -> Result<IdleAction> {
     let mut next_battery_refresh_us = esp_timer_us().saturating_add(BATTERY_REFRESH_US);
     let mut next_level_refresh_us = esp_timer_us().saturating_add(LEVEL_REFRESH_US);
@@ -1652,13 +1868,15 @@ fn wait_for_usb_action(
                 ButtonBAction::Setup => IdleAction::Setup,
             });
         }
-        if let Some(command) = poll_mode_control(control_socket, ble_audio)? {
-            match command {
-                ModeCommand::SetMode(ActiveMode::Usb) => {}
-                ModeCommand::SetMode(mode) => {
-                    return Ok(IdleAction::SetMode(mode));
-                }
-                ModeCommand::ProvisionWifi(credentials) => {
+        if let Some(event) = poll_accepted_control_event(control_socket, ble_audio, control_lease)?
+        {
+            match event {
+                ControlEvent::SetMode(command) => match command.mode {
+                    ActiveMode::Usb => {}
+                    _ => return Ok(IdleAction::SetMode(command)),
+                },
+                ControlEvent::RecordStart { .. } | ControlEvent::RecordStop => {}
+                ControlEvent::ProvisionWifi(credentials) => {
                     return Ok(IdleAction::ProvisionWifi(credentials));
                 }
             }

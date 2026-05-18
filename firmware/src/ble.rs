@@ -1,5 +1,5 @@
 use std::sync::{
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU16, Ordering},
     Arc, Mutex as StdMutex,
 };
 
@@ -16,10 +16,9 @@ use esp_idf_hal::delay::FreeRtos;
 use hkdf::Hkdf;
 use log::{info, warn};
 use m5mic_protocol::{
-    ble_audio_fragment_payload_capacity, BleAudioFragmentHeader, BLE_AUDIO_FRAGMENT_HEADER_LEN,
-    BLE_PROVISION_INFO_MAGIC, BLE_PROVISION_NONCE_LEN, BLE_PROVISION_SALT_LEN,
-    BLE_PROVISION_WIFI_MAGIC, CONTROL_MODE_BLE, CONTROL_MODE_USB, CONTROL_MODE_WIFI,
-    CONTROL_MODE_WIRELESS,
+    ble_audio_fragment_payload_capacity, parse_control_command, BleAudioFragmentHeader,
+    ControlAction, ControlMode, BLE_AUDIO_FRAGMENT_HEADER_LEN, BLE_PROVISION_INFO_MAGIC,
+    BLE_PROVISION_NONCE_LEN, BLE_PROVISION_SALT_LEN, BLE_PROVISION_WIFI_MAGIC,
 };
 use sha2::Sha256;
 
@@ -34,17 +33,18 @@ const STATUS_UUID: esp32_nimble::utilities::BleUuid =
     uuid128!("6d356d69-6321-4d35-8000-000000000004");
 const PROVISION_UUID: esp32_nimble::utilities::BleUuid =
     uuid128!("6d356d69-6321-4d35-8000-000000000005");
-const MODE_NONE: u8 = 0;
-const MODE_USB: u8 = 1;
-const MODE_WIFI: u8 = 2;
-const MODE_BLUETOOTH: u8 = 3;
+const CONTROL_NONE: u8 = 0;
+const CONTROL_MODE_USB: u8 = 1;
+const CONTROL_MODE_WIFI: u8 = 2;
+const CONTROL_MODE_BLUETOOTH: u8 = 3;
+const CONTROL_RECORD_START: u8 = 4;
+const CONTROL_RECORD_STOP: u8 = 5;
 const PROVISION_KEY_INFO: &[u8] = b"m5mic ble wifi v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BleModeCommand {
-    Usb,
-    Wifi,
-    Bluetooth,
+pub struct BleControlCommand {
+    pub action: ControlAction,
+    pub priority: u8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,7 +58,7 @@ pub struct BleAudioServer {
     status: Arc<Mutex<BLECharacteristic>>,
     connected: Arc<AtomicBool>,
     subscribed: Arc<AtomicBool>,
-    mode_command: Arc<AtomicU8>,
+    control_command: Arc<AtomicU16>,
     provision_code: u32,
     provisioned_wifi: Arc<StdMutex<Option<ProvisionedWifi>>>,
 }
@@ -71,18 +71,28 @@ impl BleAudioServer {
 
         let connected = Arc::new(AtomicBool::new(false));
         let subscribed = Arc::new(AtomicBool::new(false));
-        let mode_command = Arc::new(AtomicU8::new(MODE_NONE));
+        let control_command = Arc::new(AtomicU16::new(u16::from(CONTROL_NONE)));
         let provision_code = random_provision_code();
         let provision_salt = random_provision_salt();
         let provisioned_wifi = Arc::new(StdMutex::new(None));
 
+        server.advertise_on_disconnect(true);
+
         server.on_connect({
             let connected = connected.clone();
+            let advertising = advertising;
             move |server, desc| {
                 connected.store(true, Ordering::Relaxed);
                 info!("Bluetooth client connected: {:?}", desc);
                 if let Err(err) = server.update_conn_params(desc.conn_handle(), 12, 24, 0, 60) {
                     warn!("Bluetooth connection parameter update failed: {err:?}");
+                }
+                if server.connected_count() < esp_idf_sys::CONFIG_BT_NIMBLE_MAX_CONNECTIONS as usize
+                {
+                    match advertising.lock().start() {
+                        Ok(()) => info!("Bluetooth advertising kept active for another client"),
+                        Err(err) => warn!("Bluetooth advertising restart failed: {err:?}"),
+                    }
                 }
             }
         });
@@ -122,18 +132,18 @@ impl BleAudioServer {
         );
         control.lock().set_value(b"idle");
         control.lock().on_write({
-            let mode_command = mode_command.clone();
+            let control_command = control_command.clone();
             move |args| {
                 let data = args.recv_data();
-                if data == CONTROL_MODE_USB {
-                    mode_command.store(MODE_USB, Ordering::Relaxed);
-                    info!("Bluetooth mode command: USB");
-                } else if data == CONTROL_MODE_WIFI || data == CONTROL_MODE_WIRELESS {
-                    mode_command.store(MODE_WIFI, Ordering::Relaxed);
-                    info!("Bluetooth mode command: Wi-Fi");
-                } else if data == CONTROL_MODE_BLE {
-                    mode_command.store(MODE_BLUETOOTH, Ordering::Relaxed);
-                    info!("Bluetooth mode command: Bluetooth");
+                if let Some(command) = parse_control_command(data) {
+                    control_command.store(
+                        pack_control_command(command.action, command.priority),
+                        Ordering::Relaxed,
+                    );
+                    info!(
+                        "Bluetooth control command: {:?} priority {}",
+                        command.action, command.priority
+                    );
                 } else {
                     warn!("unknown Bluetooth control write: {:?}", data);
                 }
@@ -192,7 +202,7 @@ impl BleAudioServer {
             status,
             connected,
             subscribed,
-            mode_command,
+            control_command,
             provision_code,
             provisioned_wifi,
         })
@@ -208,13 +218,11 @@ impl BleAudioServer {
         status.notify();
     }
 
-    pub fn take_mode_command(&self) -> Option<BleModeCommand> {
-        match self.mode_command.swap(MODE_NONE, Ordering::Relaxed) {
-            MODE_USB => Some(BleModeCommand::Usb),
-            MODE_WIFI => Some(BleModeCommand::Wifi),
-            MODE_BLUETOOTH => Some(BleModeCommand::Bluetooth),
-            _ => None,
-        }
+    pub fn take_control_command(&self) -> Option<BleControlCommand> {
+        unpack_control_command(
+            self.control_command
+                .swap(u16::from(CONTROL_NONE), Ordering::Relaxed),
+        )
     }
 
     pub fn provision_code(&self) -> u32 {
@@ -370,4 +378,33 @@ fn parse_wifi_plaintext(plaintext: &[u8]) -> Result<ProvisionedWifi> {
         .context("decode provisioned password")?
         .to_string();
     Ok(ProvisionedWifi { ssid, password })
+}
+
+fn pack_control_command(action: ControlAction, priority: u8) -> u16 {
+    (u16::from(priority) << 8) | u16::from(control_code(action))
+}
+
+fn unpack_control_command(value: u16) -> Option<BleControlCommand> {
+    let action = match (value & 0xff) as u8 {
+        CONTROL_MODE_USB => ControlAction::SetMode(ControlMode::Usb),
+        CONTROL_MODE_WIFI => ControlAction::SetMode(ControlMode::Wifi),
+        CONTROL_MODE_BLUETOOTH => ControlAction::SetMode(ControlMode::Bluetooth),
+        CONTROL_RECORD_START => ControlAction::RecordStart,
+        CONTROL_RECORD_STOP => ControlAction::RecordStop,
+        _ => return None,
+    };
+    Some(BleControlCommand {
+        action,
+        priority: (value >> 8) as u8,
+    })
+}
+
+const fn control_code(action: ControlAction) -> u8 {
+    match action {
+        ControlAction::SetMode(ControlMode::Usb) => CONTROL_MODE_USB,
+        ControlAction::SetMode(ControlMode::Wifi) => CONTROL_MODE_WIFI,
+        ControlAction::SetMode(ControlMode::Bluetooth) => CONTROL_MODE_BLUETOOTH,
+        ControlAction::RecordStart => CONTROL_RECORD_START,
+        ControlAction::RecordStop => CONTROL_RECORD_STOP,
+    }
 }

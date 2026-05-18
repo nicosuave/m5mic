@@ -13,6 +13,13 @@ pub const CONTROL_MODE_USB: &[u8] = b"M5MIC_MODE_USB_V1";
 pub const CONTROL_MODE_WIRELESS: &[u8] = b"M5MIC_MODE_WIRELESS_V1";
 pub const CONTROL_MODE_WIFI: &[u8] = b"M5MIC_MODE_WIFI_V1";
 pub const CONTROL_MODE_BLE: &[u8] = b"M5MIC_MODE_BLE_V1";
+pub const CONTROL_RECORD_START: &[u8] = b"M5MIC_RECORD_START_V1";
+pub const CONTROL_RECORD_STOP: &[u8] = b"M5MIC_RECORD_STOP_V1";
+pub const CONTROL_PRIORITY_LEGACY: u8 = 10;
+pub const CONTROL_PRIORITY_PHONE: u8 = 100;
+pub const RECEIVER_PRIORITY_LEGACY: u8 = 0;
+pub const RECEIVER_PRIORITY_DESKTOP: u8 = 10;
+pub const RECEIVER_PRIORITY_PHONE: u8 = 100;
 pub const BLE_SERVICE_UUID: &str = "6d356d69-6321-4d35-8000-000000000001";
 pub const BLE_AUDIO_CHARACTERISTIC_UUID: &str = "6d356d69-6321-4d35-8000-000000000002";
 pub const BLE_CONTROL_CHARACTERISTIC_UUID: &str = "6d356d69-6321-4d35-8000-000000000003";
@@ -38,6 +45,26 @@ pub const IMA_ADPCM4_SAMPLES_PER_BYTE: usize = 2;
 pub enum Codec {
     PcmS16Le = 1,
     ImaAdpcm4 = 2,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ControlMode {
+    Usb,
+    Wifi,
+    Bluetooth,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ControlAction {
+    SetMode(ControlMode),
+    RecordStart,
+    RecordStop,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ControlCommand {
+    pub action: ControlAction,
+    pub priority: u8,
 }
 
 impl Codec {
@@ -210,7 +237,60 @@ impl AudioFrameHeader {
 pub fn discovery_response_url(payload: &str) -> Option<&str> {
     payload
         .strip_prefix(DISCOVERY_RESPONSE_PREFIX)
-        .map(str::trim)
+        .and_then(|response| response.split_ascii_whitespace().next())
+}
+
+pub fn discovery_response_priority(payload: &str) -> u8 {
+    payload
+        .strip_prefix(DISCOVERY_RESPONSE_PREFIX)
+        .map(metadata_priority)
+        .unwrap_or(RECEIVER_PRIORITY_LEGACY)
+}
+
+pub fn parse_control_command(payload: &[u8]) -> Option<ControlCommand> {
+    let payload = core::str::from_utf8(payload).ok()?;
+    let mut parts = payload.split_ascii_whitespace();
+    let action = match parts.next()? {
+        value if value.as_bytes() == CONTROL_MODE_USB => ControlAction::SetMode(ControlMode::Usb),
+        value
+            if value.as_bytes() == CONTROL_MODE_WIFI
+                || value.as_bytes() == CONTROL_MODE_WIRELESS =>
+        {
+            ControlAction::SetMode(ControlMode::Wifi)
+        }
+        value if value.as_bytes() == CONTROL_MODE_BLE => {
+            ControlAction::SetMode(ControlMode::Bluetooth)
+        }
+        value if value.as_bytes() == CONTROL_RECORD_START => ControlAction::RecordStart,
+        value if value.as_bytes() == CONTROL_RECORD_STOP => ControlAction::RecordStop,
+        _ => return None,
+    };
+
+    Some(ControlCommand {
+        action,
+        priority: metadata_priority(payload).max(CONTROL_PRIORITY_LEGACY),
+    })
+}
+
+fn metadata_priority(payload: &str) -> u8 {
+    payload
+        .split_ascii_whitespace()
+        .find_map(|part| part.strip_prefix("priority=").and_then(parse_u8))
+        .unwrap_or(0)
+}
+
+fn parse_u8(input: &str) -> Option<u8> {
+    let mut value = 0u16;
+    for byte in input.bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(u16::from(byte - b'0'))?;
+        if value > u16::from(u8::MAX) {
+            return None;
+        }
+    }
+    Some(value as u8)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -562,5 +642,66 @@ mod tests {
             185 - BLE_AUDIO_FRAGMENT_HEADER_LEN
         );
         assert_eq!(ble_audio_fragment_payload_capacity(4), 0);
+    }
+
+    #[test]
+    fn discovery_response_uses_first_token_as_url() {
+        let payload = "M5MIC_SERVER_V1 ws://10.0.0.5:47776/audio source=ios priority=100\n";
+
+        assert_eq!(
+            discovery_response_url(payload),
+            Some("ws://10.0.0.5:47776/audio")
+        );
+        assert_eq!(
+            discovery_response_priority(payload),
+            RECEIVER_PRIORITY_PHONE
+        );
+    }
+
+    #[test]
+    fn control_command_accepts_priority_metadata() {
+        let command = parse_control_command(b"M5MIC_MODE_WIFI_V1 source=ios priority=100").unwrap();
+
+        assert_eq!(
+            command,
+            ControlCommand {
+                action: ControlAction::SetMode(ControlMode::Wifi),
+                priority: CONTROL_PRIORITY_PHONE
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_control_command_gets_low_priority() {
+        let command = parse_control_command(CONTROL_MODE_USB).unwrap();
+
+        assert_eq!(
+            command,
+            ControlCommand {
+                action: ControlAction::SetMode(ControlMode::Usb),
+                priority: CONTROL_PRIORITY_LEGACY
+            }
+        );
+    }
+
+    #[test]
+    fn record_control_command_accepts_priority_metadata() {
+        let command =
+            parse_control_command(b"M5MIC_RECORD_START_V1 source=ios priority=100").unwrap();
+
+        assert_eq!(
+            command,
+            ControlCommand {
+                action: ControlAction::RecordStart,
+                priority: CONTROL_PRIORITY_PHONE
+            }
+        );
+        assert_eq!(
+            parse_control_command(CONTROL_RECORD_STOP).unwrap(),
+            ControlCommand {
+                action: ControlAction::RecordStop,
+                priority: CONTROL_PRIORITY_LEGACY
+            }
+        );
     }
 }

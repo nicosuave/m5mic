@@ -1,4 +1,6 @@
 /target/
+/ios/Build/
+/ios/**/Build/
 /firmware/target/
 /firmware/.embuild/
 /captures/

@@ -2110,6 +2110,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "m5mic-ios-core"
+version = "0.1.0"
+dependencies = [
+ "m5mic-protocol",
+]
+
+[[package]]
 name = "m5mic-protocol"
 version = "0.1.0"
 
